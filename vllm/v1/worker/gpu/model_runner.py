@@ -148,6 +148,7 @@ from vllm.v1.worker.gpu.sample.batch_shard import (
     all_to_all_logits,
     gather_sampler_output,
 )
+from vllm.v1.worker.gpu.sample.logits_processor import build_logitsprocs
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
@@ -460,6 +461,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
 
         # Initialize samplers. Model states may override via custom_sampler().
+        # Built unconditionally so pooling models reject custom logits
+        # processors instead of silently ignoring the config.
+        logitsprocs = build_logitsprocs(
+            self.vllm_config,
+            self.req_states,
+            self.is_pooling_model,
+            self.model_config.logits_processors or (),
+        )
         if self.is_last_pp_rank and not self.is_pooling_model:
             sampler_kwargs: dict[str, Any] = {
                 "max_num_reqs": self.max_num_reqs,
@@ -472,6 +481,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "enable_trace_replay": self.model_config.enable_trace_replay,
                 "reasoning_config": self.vllm_config.reasoning_config,
                 "return_sampling_mask": self.model_config.return_sampling_mask,
+                "logitsprocs": logitsprocs,
             }
             if self.vllm_config.watermark_config is None:
                 self.sampler = Sampler(**sampler_kwargs)
@@ -1089,6 +1099,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.prompt_logprobs_worker is not None:
             self.prompt_logprobs_worker.remove_request(req_id)
         self.lora_state.remove_request(req_id)
+        if self.sampler is not None:
+            self.sampler.remove_request(req_idx)
         return True
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
