@@ -31,6 +31,8 @@ class LogitsContext:
 
     # [num_logits_rows] row -> persistent request slot.
     expanded_idx_mapping: torch.Tensor
+    # [num_reqs] batch position -> persistent request slot.
+    idx_mapping: torch.Tensor
     # [num_reqs] batch position -> persistent request slot, on the host, for
     # skipping work without a device sync.
     idx_mapping_np: np.ndarray
@@ -87,6 +89,14 @@ class LogitsProcessor(ABC):
 
     def remove_request(self, req_idx: int) -> None:  # noqa: B027
         """Tear down per-slot state for a request leaving the batch."""
+
+    def apply_staged_writes(self) -> None:  # noqa: B027
+        """Flush host-side writes staged by ``add_request()`` to the device.
+
+        Called once per step before the forward pass, after the model runner
+        has flushed ``req_states``, so a processor that stages writes here can
+        read the request's tokens back on device.
+        """
 
     @abstractmethod
     def apply(self, logits: torch.Tensor, ctx: LogitsContext) -> torch.Tensor:

@@ -5,8 +5,8 @@ import numpy as np
 import torch
 
 import vllm.envs as envs
+from vllm.config import VllmConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
-from vllm.config.reasoning import ReasoningConfig
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import (
     apply_top_k_top_p,
@@ -37,6 +37,7 @@ from vllm.v1.worker.gpu.states import RequestState
 class Sampler:
     def __init__(
         self,
+        vllm_config: VllmConfig,
         max_num_reqs: int,
         vocab_size: int,
         device: torch.device,
@@ -45,7 +46,6 @@ class Sampler:
         num_speculative_tokens: int = 1,
         use_fp64_gumbel: bool = False,
         enable_trace_replay: bool = False,
-        reasoning_config: ReasoningConfig | None = None,
         return_sampling_mask: bool = False,
         logitsprocs: list[LogitsProcessor] | None = None,
     ):
@@ -54,13 +54,24 @@ class Sampler:
         self.use_fp64_gumbel = use_fp64_gumbel
 
         self.req_states = req_states
-        self.logitsprocs = logitsprocs or []
         self.sampling_states = SamplingStates(max_num_reqs, vocab_size)
-        self.penalties_state = PenaltiesState(req_states)
-        self.logit_bias_state = LogitBiasState(max_num_reqs, device)
-        self.bad_words_state = BadWordsState(req_states)
+        self.logit_bias_state = LogitBiasState(vllm_config, req_states)
+        self.penalties_state = PenaltiesState(vllm_config, req_states)
+        self.bad_words_state = BadWordsState(vllm_config, req_states)
+        self.thinking_budget_state = ThinkingBudgetState(
+            req_states, vllm_config.reasoning_config
+        )
+        # Order is load-bearing and the interface does not express it: logit
+        # bias adds while penalties apply a sign-dependent scale, so the two do
+        # not commute.
+        self.builtin_logitsprocs: list[LogitsProcessor] = [
+            self.logit_bias_state,
+            self.penalties_state,
+            self.bad_words_state,
+        ]
+        self.logitsprocs: list[LogitsProcessor] = list(logitsprocs or [])
+        self._all_logitsprocs = [*self.builtin_logitsprocs, *self.logitsprocs]
         self.logprob_token_ids_state = LogprobTokenIdsState(max_num_reqs, device)
-        self.thinking_budget_state = ThinkingBudgetState(req_states, reasoning_config)
         self.trace_replay_state = (
             TraceReplayState(req_states) if enable_trace_replay else None
         )
@@ -71,37 +82,18 @@ class Sampler:
             not return_sampling_mask and flashinfer_sampler_supported()
         )
 
-    def add_request(
-        self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
-    ) -> None:
-        self.sampling_states.add_request(req_idx, sampling_params)
-        self.penalties_state.add_request(req_idx, sampling_params)
-        self.logit_bias_state.add_request(req_idx, prompt_len, sampling_params)
-        self.bad_words_state.add_request(req_idx, sampling_params)
+    def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
+        needs_processing = self.sampling_states.add_request(req_idx, sampling_params)
+        needs_processing |= self.thinking_budget_state.add_request(
+            req_idx, sampling_params
+        )
+        for processor in self._all_logitsprocs:
+            needs_processing |= processor.add_request(req_idx, sampling_params)
+        self.needs_logits_processing[req_idx] = needs_processing
+
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
-        self.thinking_budget_state.add_request(req_idx, sampling_params)
         if self.trace_replay_state is not None:
             self.trace_replay_state.add_request(req_idx, sampling_params)
-
-        states = self.sampling_states
-        temperature = states.temperature.np[req_idx]
-        use_logitsproc = False
-        for processor in self.logitsprocs:
-            use_logitsproc |= processor.add_request(req_idx, sampling_params)
-        self.needs_logits_processing[req_idx] = (
-            self.logit_bias_state.use_logit_bias[req_idx]
-            or self.penalties_state.use_penalty[req_idx]
-            or self.bad_words_state.num_bad_words.np[req_idx] > 0
-            or (
-                self.thinking_budget_state.enabled
-                and self.thinking_budget_state.use_thinking_budget[req_idx]
-            )
-            or (temperature != 0.0 and temperature != 1.0)
-            or states.min_p.np[req_idx] != 0.0
-            or states.top_k.np[req_idx] != states.vocab_size
-            or states.top_p.np[req_idx] != 1.0
-            or use_logitsproc
-        )
 
     def remove_request(self, req_idx: int) -> None:
         """Drop per-slot state for a finished request.
@@ -110,16 +102,15 @@ class Sampler:
         a free list, so this is the only lifecycle notification custom logits
         processors receive.
         """
-        for processor in self.logitsprocs:
+        for processor in self._all_logitsprocs:
             processor.remove_request(req_idx)
 
     def apply_staged_writes(self) -> None:
         self.sampling_states.apply_staged_writes()
-        self.penalties_state.apply_staged_writes()
-        self.logit_bias_state.apply_staged_writes()
-        self.bad_words_state.apply_staged_writes()
-        self.logprob_token_ids_state.apply_staged_writes()
+        for processor in self._all_logitsprocs:
+            processor.apply_staged_writes()
         self.thinking_budget_state.apply_staged_writes()
+        self.logprob_token_ids_state.apply_staged_writes()
         if self.trace_replay_state is not None:
             self.trace_replay_state.apply_staged_writes()
 
@@ -243,31 +234,18 @@ class Sampler:
         # Copy logits to a new FP32 tensor.
         logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
 
-        # Apply logit bias (e.g., allowed_token_ids, min_tokens) in place.
-        self.logit_bias_state.apply_logit_bias(
-            logits, expanded_idx_mapping, idx_mapping_np, pos
+        ctx = LogitsContext(
+            expanded_idx_mapping=expanded_idx_mapping,
+            idx_mapping=idx_mapping,
+            idx_mapping_np=idx_mapping_np,
+            expanded_local_pos=expanded_local_pos,
+            input_ids=input_ids,
+            pos=pos,
         )
-
-        # Apply penalties in place.
-        self.penalties_state.apply_penalties(
-            logits,
-            expanded_idx_mapping,
-            idx_mapping_np,
-            input_ids,
-            expanded_local_pos,
-        )
-
-        # Apply bad words masking in place.
-        self.bad_words_state.apply_bad_words(
-            logits,
-            expanded_idx_mapping,
-            idx_mapping_np,
-            input_ids,
-            expanded_local_pos,
-        )
-
-        # Force the reasoning end marker once a request's thinking budget is
-        # reached; applied before temperature so the forced token is always kept.
+        for processor in self.builtin_logitsprocs:
+            logits = processor.apply(logits, ctx)
+        # Not on the LogitsProcessor interface yet; called here to keep its
+        # pipeline position between bad words and custom processors.
         self.thinking_budget_state.apply(
             logits,
             expanded_idx_mapping,
@@ -276,18 +254,9 @@ class Sampler:
             input_ids,
             expanded_local_pos,
         )
-
-        # Apply custom processors, before temperature scaling.
-        if self.logitsprocs:
-            ctx = LogitsContext(
-                expanded_idx_mapping=expanded_idx_mapping,
-                idx_mapping_np=idx_mapping_np,
-                expanded_local_pos=expanded_local_pos,
-                input_ids=input_ids,
-                pos=pos,
-            )
-            for processor in self.logitsprocs:
-                logits = processor.apply(logits, ctx)
+        # Custom processors run last, before temperature scaling.
+        for processor in self.logitsprocs:
+            logits = processor.apply(logits, ctx)
 
         # Apply temperature in place.
         self.sampling_states.apply_temperature(
