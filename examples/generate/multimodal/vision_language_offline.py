@@ -187,7 +187,7 @@ def run_deepseek_vl2(questions: list[str], modality: str) -> ModelRequestData:
 
 
 def run_deepseek_ocr(questions: list[str], modality: str) -> ModelRequestData:
-    from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor
+    from vllm.v1.worker.gpu.sample.ngram_per_req import NGramPerReqLogitsProcessorV2
 
     assert modality == "image"
 
@@ -196,7 +196,7 @@ def run_deepseek_ocr(questions: list[str], modality: str) -> ModelRequestData:
     engine_args = EngineArgs(
         model=model_name,
         limit_mm_per_prompt={modality: 1},
-        logits_processors=[NGramPerReqLogitsProcessor],
+        logits_processors=[NGramPerReqLogitsProcessorV2],
     )
 
     # deepseek-ocr use plain prompt template
@@ -230,7 +230,7 @@ def run_deepseek_ocr(questions: list[str], modality: str) -> ModelRequestData:
 
 
 def run_deepseek_ocr2(questions: list[str], modality: str) -> ModelRequestData:
-    from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor
+    from vllm.v1.worker.gpu.sample.ngram_per_req import NGramPerReqLogitsProcessorV2
 
     assert modality == "image"
 
@@ -239,7 +239,7 @@ def run_deepseek_ocr2(questions: list[str], modality: str) -> ModelRequestData:
     engine_args = EngineArgs(
         model=model_name,
         limit_mm_per_prompt={modality: 1},
-        logits_processors=[NGramPerReqLogitsProcessor],
+        logits_processors=[NGramPerReqLogitsProcessorV2],
     )
 
     # deepseek-ocr use plain prompt template

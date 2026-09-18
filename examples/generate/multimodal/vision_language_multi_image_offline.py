@@ -169,7 +169,7 @@ def load_deepseek_vl2(question: str, image_urls: list[str]) -> ModelRequestData:
 
 
 def load_deepseek_ocr(question: str, image_urls: list[str]) -> ModelRequestData:
-    from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor
+    from vllm.v1.worker.gpu.sample.ngram_per_req import NGramPerReqLogitsProcessorV2
 
     model_name = "deepseek-ai/DeepSeek-OCR"
 
@@ -177,7 +177,7 @@ def load_deepseek_ocr(question: str, image_urls: list[str]) -> ModelRequestData:
         model=model_name,
         max_num_seqs=2,
         limit_mm_per_prompt={"image": len(image_urls)},
-        logits_processors=[NGramPerReqLogitsProcessor],
+        logits_processors=[NGramPerReqLogitsProcessorV2],
     )
 
     placeholder = "<image>\n" * len(image_urls)
