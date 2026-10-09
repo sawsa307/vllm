@@ -7,11 +7,9 @@ head) it holds, each weighed by its global layer and head (see
 ``checksum.py``). Parts from all TP ranks and PP stages add up to the block's
 checksum.
 
-Checksums are computed without host syncs, following the model runner's
-sampled-token copy: the step that computes them also queues their copy to
-pinned host memory on a side stream ordered after the main stream, and
-records an event. Whoever needs the values later, in any thread, only waits
-for that event.
+Results are copied to pinned host memory on a side stream ordered after the
+work that produces them; readers wait only for that copy's event, never for
+the main stream.
 """
 
 import hashlib
@@ -62,17 +60,18 @@ class _LayerView:
     ``blocks`` is ``[num_blocks, kernel_blocks, heads, tokens, pieces]``. A
     piece in slice ``(layer, head)`` at position ``j`` of the slice weighs
     ``m * (2 * j + 1)``, with ``m = 2 * (layer * H + head) + 1`` for the
-    global head (see ``checksum.py``). Neither depends on this rank's shard
-    or on the cache's memory layout.
+    global head (see ``checksum.py``).
     """
 
     def __init__(
         self, pieces: torch.Tensor, first_slice: int, replica_key: ReplicaKey
     ) -> None:
-        """Args:
-        pieces: The layer's cache viewed as 8-byte pieces.
-        first_slice: ``layer * H + head`` of this rank's first head.
-        replica_key: The replicas and replica index of this rank's heads.
+        """Precompute this rank's piece weights.
+
+        Args:
+            pieces: The layer's cache viewed as 8-byte pieces.
+            first_slice: ``layer * H + head`` of this rank's first head.
+            replica_key: The replicas and replica index of this rank's heads.
 
         """
         _, kernel_blocks, heads, tokens, num_pieces = pieces.shape
@@ -105,7 +104,7 @@ class _LayerView:
         Args:
             block_ids: ``[n]`` logical block ids on the device.
             valid_tokens: ``[n]`` tokens to include from the start of each block.
-            out: ``[n]`` int64 accumulator; int64 wrap-around equals uint64.
+            out: ``[n]`` int64 accumulator, wrapping around (mod 2**64).
 
         """
         for start in range(0, block_ids.shape[0], self.rows_per_gather):
