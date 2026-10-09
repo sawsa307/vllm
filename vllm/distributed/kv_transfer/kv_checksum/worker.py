@@ -476,7 +476,8 @@ class KVChecksumWorker:
         received: dict[str, bytes] | None = None,
         defer_sends: bool = False,
     ) -> KVChecksumOutput | None:
-        """Compute the checksums this step allows and start their copy.
+        """Checksum this step's sends and finished loads, and start copying the
+        results to host.
 
         Args:
             finished_recving: Requests whose load this worker finished.

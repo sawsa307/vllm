@@ -329,26 +329,22 @@ class KVChecksumScheduler:
         """
         self._recvs.pop(request.request_id, None)
         pending = self._sends.pop(request.request_id, None)
-        in_params = pending is not None and (
-            pending.carrier == KVChecksumCarrier.KV_TRANSFER_PARAMS
-        )
         if (
             pending is None
             # Aborted or failed: its KV is not sent.
             or request.get_finished_reason() not in _SENT_FINISH_REASONS
-            or (in_params and kv_transfer_params is None)
         ):
             return kv_transfer_params
-        payload = self._payload(request.request_id, pending)
-        if payload is None:
-            return kv_transfer_params
-        if in_params:
-            assert kv_transfer_params is not None
+        if pending.carrier == KVChecksumCarrier.CONNECTOR:
+            if (payload := self._payload(request.request_id, pending)) is not None:
+                self._connector.send_kv_checksums(request, payload.to_bytes())
+        elif (
+            kv_transfer_params is not None
+            and (payload := self._payload(request.request_id, pending)) is not None
+        ):
             kv_transfer_params[KV_TRANSFER_PARAMS_KEY] = base64.b64encode(
                 payload.to_bytes()
             ).decode()
-        else:
-            self._connector.send_kv_checksums(request, payload.to_bytes())
         return kv_transfer_params
 
     def _blocks(
