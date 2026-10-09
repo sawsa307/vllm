@@ -13,15 +13,12 @@ model runner's streams, and the engine's failure handling.
   subclasses, loaded on the consumer with
   `kv_connector_module_path=tests.v1.kv_connector.nixl_integration.kv_checksum_fault_injection`.
   With `kv_connector_extra_config.test_corrupt_kv=true`, they flip one bit
-  of the first block of every finished load, after the connector reports
-  the load finished and before the worker checksums it.
-  `test_corrupt_kv_piece` picks the 8-byte piece of that block's first token
-  and head (default 0). Without `test_corrupt_kv` they behave like the stock
-  connectors.
+  of the first block the checksum worker checks for every finished load,
+  after the connector reports the load finished and before the worker
+  checksums it. Without it they behave like the stock connectors.
 - `kv_checksum_smoke.sh`: one producer, one consumer and the toy proxy on one
-  node, four stages (below), each with fresh servers. Both servers run with
-  `VLLM_GPU_SYNC_CHECK=error`, so a host sync in the engine step fails the
-  step.
+  node, four stages (below), each with fresh servers. It checks each stage's
+  results and exits non-zero if any stage misses them.
 
 ## Running
 
@@ -35,32 +32,43 @@ CONNECTOR=NixlPushConnector bash .../kv_checksum_smoke.sh
 # Heterogeneous TP
 PREFILLER_TP_SIZE=2 PREFILLER_GPUS=0,1 DECODER_GPUS=2 bash .../kv_checksum_smoke.sh
 DECODER_TP_SIZE=2 DECODER_GPUS=1,2 bash .../kv_checksum_smoke.sh
+
+# Model runner V2
+VLLM_USE_V2_MODEL_RUNNER=1 bash .../kv_checksum_smoke.sh
 ```
 
 Logs and per-stage outputs go to `$LOG_DIR` (default `/tmp/kv_checksum_smoke`).
 
 ## Stages and expected results
 
-Each stage sends `NUM_REQUESTS` (default 4) greedy requests and reports the
-HTTP codes and log counts: `mismatches` ("KV checksum mismatch", consumer),
-`unverified` ("KV checksums not verified", consumer), `not_sent`
+Each stage sends `NUM_REQUESTS` (default 4) greedy requests. A request
+succeeds when text comes back: the toy proxy streams the consumer's
+response, so it has already answered HTTP 200 when a consumer request fails.
+The stage then counts log lines: `mismatches` ("KV checksum mismatch",
+consumer), `unverified` ("KV checksums not verified", consumer), `not_sent`
 ("KV checksums not sent", producer) and `syncs` ("GPU<->CPU sync detected",
-both).
+both servers, which run with `VLLM_GPU_SYNC_CHECK=error`).
 
-| Stage | Consumer config | Expected |
-| --- | --- | --- |
-| `clean` | fail-closed | all 200; mismatches 0, unverified 0, not_sent 0, syncs 0 |
-| `corrupt_fail_open` | `test_corrupt_kv` | all 200; mismatches = requests; syncs 0 |
-| `corrupt_fail` | fail-closed, `kv_load_failure_policy=fail`, `test_corrupt_kv` | all non-200 (the requests fail); mismatches = requests |
-| `corrupt_recompute` | fail-closed, `kv_load_failure_policy=recompute`, `test_corrupt_kv` | all 200; mismatches = requests; outputs match `clean` |
+| Stage | Consumer config | Requests succeeding | Mismatches |
+| --- | --- | --- | --- |
+| `clean` | fail-closed | all | 0 |
+| `corrupt_fail_open` | `test_corrupt_kv` | all | one per request |
+| `corrupt_fail` | fail-closed, `kv_load_failure_policy=fail`, `test_corrupt_kv` | none | one per request |
+| `corrupt_recompute` | fail-closed, `kv_load_failure_policy=recompute`, `test_corrupt_kv` | all | one per request |
 
-`clean` shows the checksums pass end to end without false positives and
-without host syncs. The `corrupt_*` stages show a one-bit corruption is
-caught and handled per policy, and with `recompute` the consumer recomputes
-the prompt and produces the same output as the clean run.
+Every stage also expects no unverified load, no unsent checksums and no
+host sync.
 
-`warning_once` logs each unverified reason once per process, so
-`unverified` counts reasons, not requests.
+- `clean` shows the checksums pass end to end without false positives and
+  without host syncs.
+- The `corrupt_*` stages show a one-bit corruption is caught and handled per
+  policy. With equal TP sizes the script also reports whether the recomputed
+  outputs match the clean run (informational: numerics may differ).
+- `VLLM_GPU_SYNC_CHECK=error` fails the engine at the first host sync in a
+  step, including syncs outside the checksum code; the stage's later
+  results are then meaningless, so look at the first failure in the logs.
+- "KV checksums not verified" and "KV checksums not sent" are logged once
+  per reason per process, so they count reasons, not requests.
 
 ## Results
 
