@@ -113,7 +113,7 @@ class KVTransferConfig:
     """Fail a KV load whose checksums mismatch or cannot be verified, as a KV
     load failure handled by kv_load_failure_policy. Otherwise such loads are
     only logged, and their blocks are used and prefix-cached as usual. Enable
-    KV checksums on producers before consumers, whose loads are otherwise
+    KV checksums on producers first: loads without checksums are
     unverified."""
 
     def compute_hash(self) -> str:
