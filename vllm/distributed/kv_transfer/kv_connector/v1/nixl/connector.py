@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_checksum.checksum import KVChecksumCarrier
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineId,
 )
@@ -75,6 +76,7 @@ logger = init_logger(__name__)
 
 
 class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
+    _KV_CHECKSUM_CARRIER: KVChecksumCarrier
     """Base connector with common logic shared by pull and push modes."""
 
     @property
@@ -190,6 +192,17 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
     def on_new_request(self, request: "Request") -> None:
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_new_request(request)
+
+    def kv_checksum_carrier(
+        self, request: "Request", receiving: bool
+    ) -> KVChecksumCarrier | None:
+        params = request.kv_transfer_params
+        # Loads are set up by do_remote_prefill (then cleared). A load with
+        # do_remote_decode set is NIXL's bidirectional transfer, a prefiller
+        # reloading a decoder's KV from an earlier turn: no checksums.
+        if not params or bool(params.get("do_remote_decode")) == receiving:
+            return None
+        return self._KV_CHECKSUM_CARRIER
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         assert self.connector_scheduler is not None
@@ -339,6 +352,8 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
 class NixlPullConnector(NixlBaseConnector):
     """Pull-based (READ) NIXL KV transfer connector."""
 
+    _KV_CHECKSUM_CARRIER = KVChecksumCarrier.KV_TRANSFER_PARAMS
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -367,6 +382,9 @@ class NixlPullConnector(NixlBaseConnector):
 class NixlPushConnector(NixlBaseConnector):
     """Push-based (WRITE) NIXL KV transfer connector."""
 
+    # On the completion notif of the WRITE that delivers the KV.
+    _KV_CHECKSUM_CARRIER = KVChecksumCarrier.CONNECTOR
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -390,6 +408,10 @@ class NixlPushConnector(NixlBaseConnector):
             )
         else:
             raise ValueError(f"Unsupported KVConnectorRole: {role}")
+
+    def send_kv_checksums(self, request: "Request", checksums: bytes) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.send_kv_checksums(request.request_id, checksums)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Drive push processing on the worker.
