@@ -197,8 +197,9 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         self, request: "Request", receiving: bool
     ) -> KVChecksumCarrier | None:
         params = request.kv_transfer_params
-        # do_remote_decode marks the producer. A load with it set is a
-        # bidirectional load of a consumer's blocks, which have no checksums.
+        # Loads are set up by do_remote_prefill (then cleared). A load with
+        # do_remote_decode set is NIXL's bidirectional transfer, a prefiller
+        # reloading a decoder's KV from an earlier turn: no checksums.
         if not params or bool(params.get("do_remote_decode")) == receiving:
             return None
         return self._KV_CHECKSUM_CARRIER
