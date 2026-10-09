@@ -13,6 +13,7 @@ import torch
 
 from vllm.distributed.kv_transfer.kv_checksum.scheduler import (
     KV_TRANSFER_PARAMS_KEY,
+    KVChecksumScheduler,
 )
 from vllm.distributed.kv_transfer.kv_checksum.worker import KVChecksumWorker
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -25,6 +26,7 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import FinishReason, Request, RequestStatus
 
 from .utils import (
+    MockKVConnector,
     create_model_runner_output,
     create_request,
     create_scheduler,
@@ -345,3 +347,21 @@ def test_groups_skipped_on_both_sides_are_ignored(producer_group):
     request = create_request(1, NUM_TOKENS, do_remote_prefill=True)
     errors = _error_ids(_load(producer, consumer, request, params))
     assert errors == (set() if producer_group == "skipped" else {request.request_id})
+
+
+@pytest.mark.parametrize("fail_closed", [False, True])
+def test_connector_without_carrier_is_refused(fail_closed):
+    """With a connector that cannot carry checksums no load would be checked:
+    fail-closed refuses to start, fail-open disables checksums."""
+    vllm_config = create_vllm_config(kv_role="kv_consumer")
+    vllm_config.kv_transfer_config.enable_kv_checksum = True
+    vllm_config.kv_transfer_config.kv_checksum_fail_closed = fail_closed
+    connector = object.__new__(MockKVConnector)
+    kv_cache_config = _kv_cache_config(HEADS, LAYERS)
+    if fail_closed:
+        with pytest.raises(ValueError, match="does not carry KV checksums"):
+            KVChecksumScheduler.create(vllm_config, kv_cache_config, connector)
+    else:
+        assert (
+            KVChecksumScheduler.create(vllm_config, kv_cache_config, connector) is None
+        )

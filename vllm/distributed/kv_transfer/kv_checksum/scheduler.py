@@ -1,14 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Scheduler-side KV checksums.
-
-The producer's scheduler picks the blocks each worker checksums in the step
-that finishes a request's prefill, sums the workers' parts, and hands the
-result to the connector's carrier when the request finishes. The consumer's
-scheduler picks the blocks a load writes, sums its workers' parts once the
-load finished, and compares them with the producer's before the request can
-be scheduled again.
-"""
+"""Scheduler-side KV checksums: the blocks workers checksum, and verification
+of loads against the producer's checksums."""
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -28,6 +21,7 @@ from vllm.distributed.kv_transfer.kv_checksum.checksum import (
     kv_checksum_enabled,
     num_valid_tokens,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.engine import FinishReason
@@ -35,7 +29,6 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, SlidingWindowSpec
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
     from vllm.v1.outputs import KVConnectorOutput
@@ -74,8 +67,10 @@ class KVChecksumPayload:
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "KVChecksumPayload":
-        """Raises:
-        ValueError: If ``data`` is not a payload of this version.
+        """Decode a payload.
+
+        Raises:
+            ValueError: If ``data`` is not a payload of this version.
 
         """
         try:
@@ -133,8 +128,10 @@ class _Pending:
             logger.debug("Invalid KV checksums for request %s: %s", req_id, e)
 
     def check_complete(self, num_workers: int) -> None:
-        """Raises:
-        _Unverified: If not every worker reported the request.
+        """Check that every worker reported the request.
+
+        Raises:
+            _Unverified: If not.
 
         """
         if len(self.reports) < num_workers:
@@ -147,8 +144,8 @@ class _Pending:
         return frozenset().union(*(r.skipped_groups for _, r in self.reports.values()))
 
     def fingerprint(self, group_id: int) -> int:
-        """The group's fingerprint over the whole model: the sum over PP
-        stages of one TP rank's fingerprint each."""
+        """The group's fingerprint for the whole model: one TP rank's per PP
+        stage, summed."""
         stages = {pp_rank: record for (pp_rank, _), (_, record) in self.reports.items()}
         total = sum(record.fingerprints.get(group_id, 0) for record in stages.values())
         return total % 2**64
@@ -187,7 +184,7 @@ class KVChecksumScheduler:
         self,
         vllm_config: "VllmConfig",
         kv_cache_config: KVCacheConfig,
-        connector: "KVConnectorBase_V1",
+        connector: KVConnectorBase_V1,
     ):
         kv_transfer_config = vllm_config.kv_transfer_config
         assert kv_transfer_config is not None
@@ -211,9 +208,20 @@ class KVChecksumScheduler:
         cls,
         vllm_config: "VllmConfig",
         kv_cache_config: KVCacheConfig,
-        connector: "KVConnectorBase_V1 | None",
+        connector: KVConnectorBase_V1 | None,
     ) -> "KVChecksumScheduler | None":
         if connector is None or not kv_checksum_enabled(vllm_config):
+            return None
+        if (
+            type(connector).kv_checksum_carrier
+            is KVConnectorBase_V1.kv_checksum_carrier
+        ):
+            message = f"{type(connector).__name__} does not carry KV checksums"
+            kv_transfer_config = vllm_config.kv_transfer_config
+            assert kv_transfer_config is not None
+            if kv_transfer_config.kv_checksum_fail_closed:
+                raise ValueError(f"{message}, so no load could be verified.")
+            logger.warning("%s; KV checksums are disabled.", message)
             return None
         return cls(vllm_config, kv_cache_config, connector)
 
@@ -235,7 +243,8 @@ class KVChecksumScheduler:
         blocks: "KVCacheBlocks",
         num_local_computed_tokens: int,
     ) -> None:
-        """Checksum the blocks a starting load writes once it finished.
+        """Checksum the blocks a load starting this step writes, once it
+        finishes.
 
         ``request.num_computed_tokens`` must already include the loaded
         tokens.
@@ -260,8 +269,8 @@ class KVChecksumScheduler:
         self._recvs[request.request_id] = pending
         self._scheduled.reqs_to_recv[request.request_id] = checksum_blocks
 
-    def take_scheduled(self) -> KVChecksumScheduled | None:
-        """The requests this step's workers checksum."""
+    def build_checksum_meta(self) -> KVChecksumScheduled | None:
+        """The requests this step's workers checksum; resets them."""
         scheduled = self._scheduled
         if not scheduled.reqs_to_send and not scheduled.reqs_to_recv:
             return None
@@ -513,9 +522,9 @@ def _non_null_run(
 def _sum_replicas(
     groups: list[KVChecksumGroup], num_positions: int
 ) -> list[np.ndarray]:
-    """The group's checksums once per check, where check ``k`` sums copy
-    ``k % R`` of the layers replicated on ``R`` ranks: each check covers every
-    layer once, and every copy is in some check.
+    """The consumer's checksums of a group, one per check. Check ``k`` sums
+    copy ``k % R`` of each layer replicated on ``R`` ranks, so every check
+    covers each layer once and every copy is checked.
 
     Raises:
         _Unverified: If a check misses a copy.
