@@ -78,9 +78,8 @@ class KVChecksumBlocks:
     """The blocks of one request to checksum.
 
     Attributes:
-        num_tokens: Tokens whose KV the blocks hold. Slots of the last block at
-            or past this count are excluded, so later writes there (decode
-            tokens, draft tokens) cannot change the checksum.
+        num_tokens: Tokens whose KV the blocks hold; slots of the last block at
+            or past this count are not checksummed.
         groups: Per KV cache group id, the position of the first block and the
             ids of the blocks at consecutive positions from there.
 
@@ -122,16 +121,15 @@ class KVChecksumRecord:
     """One worker's checksums for one step.
 
     Attributes:
-        checksums: Per request the worker checksummed this step, its partial
-            checksums per group. A request whose groups have no layers on
-            this worker maps to an empty dict, so that the worker still
-            counts as having reported it.
-        skipped_groups: Groups this worker has layers of but cannot
-            checksum. Checksums summed over workers are partial for them.
+        checksums: Partial checksums per request and group. Every request the
+            worker processed this step has an entry, empty if none of its
+            groups has layers here, so the scheduler can tell which workers
+            reported it.
+        skipped_groups: Groups with layers on this worker that it cannot
+            checksum.
         fingerprints: Per transfer group, the sum of a hash of each of this
-            worker's layers in it (name, spec type, block size, dtype). Summed
-            over PP stages, it identifies the group's layers whatever the PP
-            layout.
+            worker's layers in it (name and layout). Summed over PP stages it
+            identifies the group's layers.
 
     """
 
@@ -146,7 +144,7 @@ class KVChecksumRecord:
 
 
 def num_valid_tokens(position: int, block_size: int, num_tokens: int) -> int:
-    """Tokens of the first ``num_tokens`` that block ``position`` holds."""
+    """How many of the first ``num_tokens`` tokens block ``position`` holds."""
     return min(block_size, max(0, num_tokens - position * block_size))
 
 
