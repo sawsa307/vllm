@@ -94,6 +94,11 @@ class KVChecksumScheduled:
     reqs_to_recv: dict[str, KVChecksumBlocks] = field(default_factory=dict)
     """Scheduled to be checksummed once the KV load started this step finishes."""
 
+    reqs_to_load: dict[str, KVChecksumBlocks] = field(default_factory=dict)
+    """Loads of offloaded KV started this step, checked once they finish
+    against the checksums offloaded with the KV (see
+    ``KVChecksumWorker.init_block_checksums``)."""
+
 
 @dataclass
 class KVChecksumGroup:
@@ -103,12 +108,16 @@ class KVChecksumGroup:
         start: Position of the first row.
         replica_keys: The replica key of each column.
         values: ``(num_positions, len(replica_keys))`` uint64 partial checksums.
+        stored: For a load of offloaded KV, ``(num_positions,)`` uint64
+            checksums offloaded with the KV: each row's partial checksums,
+            summed when the KV was offloaded.
 
     """
 
     start: int
     replica_keys: list[ReplicaKey]
     values: np.ndarray
+    stored: np.ndarray | None = None
 
 
 @dataclass
