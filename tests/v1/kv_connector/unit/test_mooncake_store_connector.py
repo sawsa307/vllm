@@ -1163,3 +1163,59 @@ def test_shutdown_scheduler_role_is_noop():
     # Scheduler role holds no store handle, so shutdown must be a safe no-op.
     assert connector.connector_worker is None
     connector.shutdown()
+
+
+def test_scheduler_removes_blocks_that_failed_kv_checksums():
+    """With KV checksums, a load that fails its check has the mismatching
+    blocks removed from the store, keyed by the hash at each block's end;
+    one that could not be checked removes nothing."""
+    vllm_config = _make_vllm_config()
+    vllm_config.kv_transfer_config.enable_kv_checksum = True
+    kv_cache_config = _make_kv_cache_config()
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
+            "scheduler.LookupKeyClient"
+        ) as mock_client_cls,
+    ):
+        conn = mooncake_store_connector.MooncakeStoreConnector(
+            vllm_config, KVConnectorRole.SCHEDULER, kv_cache_config
+        )
+    request = MagicMock(request_id="req", block_hashes=[b"h0", b"h1", b"h2"])
+    client = mock_client_cls.return_value
+
+    assert conn.get_kv_checksum_sources(request) == {
+        CacheHitSource.EXTERNAL_UNSPECIFIED
+    }
+    conn.on_kv_checksum_failure(request, {})
+    client.remove.assert_not_called()
+    conn.on_kv_checksum_failure(request, {0: [1, 2]})
+    client.remove.assert_called_once_with([0, 0], [b"h1", b"h2"])
+
+
+def test_lookup_key_client_remove_uses_typed_protocol():
+    """LookupKeyClient.remove() sends REMOVE_MSG with the group of each
+    hash, and resolves to whether the worker removed every key."""
+    vllm_config = _make_vllm_config()
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
+        "worker.make_zmq_socket"
+    ) as mock_make_socket:
+        client = worker.LookupKeyClient(vllm_config)
+
+    fake_socket = mock_make_socket.return_value
+    fake_socket.recv.return_value = protocol.RESP_OK
+    assert client.remove([0, 1], [b"ab", b"cd"]).result() is True
+    sent_frames = fake_socket.send_multipart.call_args[0][0]
+    assert sent_frames == (
+        protocol.REMOVE_MSG,
+        (0).to_bytes(4, "big") + (1).to_bytes(4, "big"),
+        (2).to_bytes(2, "big"),
+        b"abcd",
+    )
+
+    fake_socket.recv.return_value = protocol.RESP_ERR
+    assert client.remove([0], [b"ab"]).result() is False
