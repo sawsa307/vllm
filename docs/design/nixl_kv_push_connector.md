@@ -89,11 +89,13 @@ The writer thread blocks on ``_push_writer_wake`` (a
 ``threading.Event``) when it has no work. Three callers set the
 event:
 
-1. **``start_load_kv``** (worker main thread, called once per engine
-   step with the scheduler's metadata) — sets the wake only when the
-   step actually hands the writer new work, i.e. when
-   ``meta.push_registrations`` or ``meta.push_finished_blocks`` is
-   non-empty. This is the wake for new transfers.
+1. **``bind_connector_metadata``** and **``start_load_kv``** (worker
+   main thread, once per engine step with the scheduler's metadata) —
+   set the wake only when the step hands the writer new work. P's
+   ``meta.push_finished_blocks`` are handed over at bind, before the
+   step's forward: those requests finished in an earlier step's output,
+   so their KV is complete. D's ``meta.push_registrations`` are handed
+   over in ``start_load_kv``. This is the wake for new transfers.
 2. **``get_finished``** (worker main thread, called once per engine
    step to report completions) — always sets the wake. The writer is
    the sole consumer of ``nixl_wrapper.get_new_notifs()`` for push,

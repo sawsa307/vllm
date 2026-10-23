@@ -39,6 +39,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
     NixlBaseConnectorWorker,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
+    NixlPushConnector,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_REG_NOTIF_PREFIX,
     NixlAgentMetadata,
@@ -629,8 +632,8 @@ class TestPushWriterStartLoadKv:
         assert "req-C" not in w._pending_d_registrations
 
     def test_start_load_kv_enqueues_to_writer(self):
-        """``start_load_kv`` should hand registrations + finished blocks
-        to the writer queues without doing matching itself."""
+        """``start_load_kv`` should hand registrations to the writer queue
+        without doing matching itself."""
         w = _StubWriterWorker.fresh()
         # Stub heartbeats to a no-op; tests don't exercise the heartbeat
         # path here.
@@ -642,15 +645,25 @@ class TestPushWriterStartLoadKv:
         meta.push_registrations = {
             "req-D": _registration_data("req-D"),
         }
-        meta.push_finished_blocks = {
-            "req-E": ([5, 6, 7],),
-        }
 
         w.start_load_kv(meta)
 
-        # Things are queued for the writer; nothing fires yet.
+        # Queued for the writer; nothing fires yet.
         assert w._reg_send_inbox.qsize() == 1
-        assert w._finished_blocks_inbox.qsize() == 1
+        assert w._push_writer_wake.is_set()
+        assert w.start_push_calls == []
+
+    def test_bind_hands_finished_blocks_to_writer_before_forward(self):
+        """P's finished blocks reach the writer when the step's metadata is
+        bound, before the forward, not in ``start_load_kv`` after it."""
+        connector = object.__new__(NixlPushConnector)
+        connector.connector_worker = w = _StubWriterWorker.fresh()
+        meta = NixlConnectorMetadata()
+        meta.push_finished_blocks = {"req-E": ([5, 6, 7],)}
+
+        connector.bind_connector_metadata(meta)
+
+        assert w._finished_blocks_inbox.get_nowait() == ("req-E", ([5, 6, 7],))
         assert w._push_writer_wake.is_set()
         assert w.start_push_calls == []
 
@@ -666,6 +679,7 @@ class TestPushWriterStartLoadKv:
         meta.reqs_in_batch.add("req")
         meta.reqs_to_send["req"] = time.perf_counter() + 10
 
+        w.enqueue_finished_blocks(meta)
         w.start_load_kv(meta)
 
         assert w._finished_blocks_inbox.empty() is (not sharded)

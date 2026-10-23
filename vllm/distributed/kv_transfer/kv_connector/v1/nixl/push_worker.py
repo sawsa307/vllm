@@ -186,7 +186,17 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             self._send_failures.clear()
         super().shutdown()
 
-    # --- Engine-main-thread entry point -------------------------------- #
+    # --- Engine-main-thread entry points ------------------------------- #
+
+    def enqueue_finished_blocks(self, metadata: NixlConnectorMetadata) -> None:
+        """P side: hand newly finished blocks to the writer, which matches
+        them against D registrations."""
+        if self.pcp_rank > 0 and not self.pcp_dcp_sharded:
+            return
+        if metadata.push_finished_blocks:
+            for req_id, block_ids in metadata.push_finished_blocks.items():
+                self._finished_blocks_inbox.put((req_id, block_ids))
+            self._push_writer_wake.set()
 
     def start_load_kv(self, metadata: NixlConnectorMetadata):
         """Pre-process metadata; defer NIXL ops to the writer thread."""
@@ -220,12 +230,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         if metadata.push_registrations:
             for req_id, reg_data in metadata.push_registrations.items():
                 self._reg_send_inbox.put((req_id, reg_data))
-            self._push_writer_wake.set()
-
-        # --- P-side: newly finished blocks awaiting a D registration match ---
-        if metadata.push_finished_blocks:
-            for req_id, block_ids in metadata.push_finished_blocks.items():
-                self._finished_blocks_inbox.put((req_id, block_ids))
             self._push_writer_wake.set()
 
         # Batch + lease tracking (same as pull).

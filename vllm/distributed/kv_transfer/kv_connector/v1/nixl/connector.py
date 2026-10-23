@@ -415,6 +415,14 @@ class NixlPushConnector(NixlBaseConnector):
         else:
             raise ValueError(f"Unsupported KVConnectorRole: {role}")
 
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        super().bind_connector_metadata(connector_metadata)
+        if self.connector_worker is not None:
+            assert isinstance(connector_metadata, NixlConnectorMetadata)
+            # These requests finished in an earlier step's output, so their KV
+            # is complete: start their WRITEs before this step's forward.
+            self.connector_worker.enqueue_finished_blocks(connector_metadata)
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Drive push processing on the worker.
 
