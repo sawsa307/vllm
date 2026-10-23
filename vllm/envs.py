@@ -144,6 +144,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_MUSE_MOE_ONLINE_QUANT: str = ""
     VLLM_ROCM_MUSE_FUSED_FINALIZE_ALL_REDUCE: bool = True
     VLLM_ROCM_MUSE_SHARD_PROJECTIONS: bool = True
+    VLLM_ROCM_MUSE_MOE_ROUTE_MODE: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1338,6 +1339,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # norm that follows. The full weights stay loaded.
     "VLLM_ROCM_MUSE_SHARD_PROJECTIONS": lambda: (
         os.getenv("VLLM_ROCM_MUSE_SHARD_PROJECTIONS", "1").lower() in ("true", "1")
+    ),
+    # Muse Spark on ROCm: take the AITER MXFP4 experts' per-route rows from
+    # fused_moe(per_slot_output=) when the installed AITER has it, instead of
+    # top-1 over a per-route copy of the input. Disabled by =0.
+    "VLLM_ROCM_MUSE_MOE_ROUTE_MODE": lambda: bool(
+        int(os.getenv("VLLM_ROCM_MUSE_MOE_ROUTE_MODE", "1"))
     ),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops

@@ -76,6 +76,8 @@ from .muse_moe_runner import (
     MuseMoERunner,
     MuseSparkQuarkOCPMXFusedMoE,
     MuseSparkRoutedExperts,
+    aiter_returns_per_slot_routes,
+    per_slot_routes_for_batch,
 )
 from .ops.column_gather import MuseSparkColumnGather, maybe_create_column_gather
 from .ops.fused_finalize_all_reduce import maybe_create_finalize_all_reduce
@@ -395,10 +397,26 @@ class MuseSpark1xMoE(nn.Module):
             self.unpooler, hidden_states
         )
 
+    @functools.cached_property
+    def _experts_route_per_slot(self) -> bool:
+        return aiter_returns_per_slot_routes()
+
+    @functools.cached_property
+    def _experts_use_ep(self) -> bool:
+        return self.experts.routed_experts.moe_config.moe_parallel_config.use_ep
+
     def _pool(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.pooler is None:
             return hidden_states
         norm = self.pre_expert_norm
+        # AITER MXFP4 experts take one input row per route, unless they return
+        # their per-route rows directly (per-slot routes).
+        expand = self._experts_take_expanded_input and not (
+            self._experts_route_per_slot
+            and per_slot_routes_for_batch(
+                hidden_states.shape[0], self.top_k, self._experts_use_ep
+            )
+        )
         if (
             norm is not None
             and norm.variance_size_override is None
@@ -408,7 +426,7 @@ class MuseSpark1xMoE(nn.Module):
             return self.column_gather.gather_rmsnorm(
                 self._local_columns(self.pooler, hidden_states),
                 norm,
-                self.top_k if self._experts_take_expanded_input else 1,
+                self.top_k if expand else 1,
             )
         hidden_states, _ = self.pooler(hidden_states)
         if norm is None:
@@ -420,7 +438,7 @@ class MuseSpark1xMoE(nn.Module):
                 norm.variance_epsilon,
                 norm.fused_gain_center,
                 norm.applies_weight_before_norm and norm.has_weight,
-                self.top_k,
+                self.top_k if expand else 1,
             )
         return norm(hidden_states)
 
