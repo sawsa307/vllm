@@ -145,6 +145,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_MUSE_FUSED_FINALIZE_ALL_REDUCE: bool = True
     VLLM_ROCM_MUSE_SHARD_PROJECTIONS: bool = True
     VLLM_ROCM_MUSE_FUSED_ATTN_ALL_REDUCE: bool = True
+    VLLM_ROCM_MUSE_FP32_ROUTER_INPUT: bool = False
     VLLM_ROCM_MUSE_MOE_ROUTE_MODE: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
@@ -1346,6 +1347,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # boundary kernel that follows.
     "VLLM_ROCM_MUSE_FUSED_ATTN_ALL_REDUCE": lambda: (
         os.getenv("VLLM_ROCM_MUSE_FUSED_ATTN_ALL_REDUCE", "1").lower() in ("true", "1")
+    ),
+    # Muse Spark on ROCm (experimental, off by default): for 33-128 tokens feed
+    # the MoE router the unrounded FP32 pre-FFN-norm output, as on CUDA, instead
+    # of the BF16 one (the BF16x3 router keeps only its weights in FP32).
+    "VLLM_ROCM_MUSE_FP32_ROUTER_INPUT": lambda: (
+        os.getenv("VLLM_ROCM_MUSE_FP32_ROUTER_INPUT", "0").lower() in ("true", "1")
     ),
     # Muse Spark on ROCm: take the AITER MXFP4 experts' per-route rows from
     # fused_moe(per_slot_output=) when the installed AITER has it, instead of

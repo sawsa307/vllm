@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import ignore_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
@@ -133,8 +134,14 @@ def norm_residual_then_norm(
     pre_norm: MuseSpark1xRMSNorm,
     *,
     out_dtype: torch.dtype,
+    router_input: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Post-norm, blend and pre-norm in one kernel; returns ``(out, new_stream)``."""
+    """Post-norm, blend and pre-norm in one kernel; returns ``(out, new_stream)``.
+
+    If supplied, router_input receives the unrounded FP32 pre-norm result.
+    """
+    if router_input is not None:
+        x = materialize(x)
     if isinstance(x, MuseSpark1xColumnShardedStream):
         if x.gather.supports_boundary(
             x.branch, x.stream, x.post_norm, x.connection, pre_norm
@@ -171,8 +178,11 @@ def norm_residual_then_norm(
                 pre_norm.applies_weight_before_norm and pre_norm.has_weight
             ),
             out_dtype=out_dtype,
+            router_out=router_input,
         )
     new_stream = norm_then_gated_residual(x)
+    if router_input is not None:
+        router_input.copy_(pre_norm(new_stream, out_dtype=torch.float32))
     return pre_norm(new_stream, out_dtype=out_dtype), new_stream
 
 
@@ -284,6 +294,7 @@ class MuseSpark1xMoE(nn.Module):
             self.pre_expert_norm = None
 
         self.intermediate_size = config.moe_intermediate_size
+        self.fp32_router_input = envs.VLLM_ROCM_MUSE_FP32_ROUTER_INPUT
         self.column_gather = None
         if self.tp_size > 1:
             maybe_create_finalize_all_reduce(
@@ -354,7 +365,19 @@ class MuseSpark1xMoE(nn.Module):
             else:
                 self._router_planes.copy_(planes)
 
-    def _router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def wants_fp32_router_input(self, num_tokens: int) -> bool:
+        """Whether the router reads the FP32 pre-norm output (experimental)."""
+        return (
+            self.fp32_router_input
+            and not self.is_sequence_parallel
+            and 32 < num_tokens <= 128
+        )
+
+    def _router_logits(
+        self, hidden_states: torch.Tensor, router_input: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if router_input is not None:
+            return self.router(router_input)[0]
         planes = getattr(self, "_router_planes", None)
         if (
             planes is not None
@@ -444,15 +467,19 @@ class MuseSpark1xMoE(nn.Module):
         return norm(hidden_states)
 
     def forward(
-        self, hidden_states: torch.Tensor, defer_column_gather: bool = False
+        self,
+        hidden_states: torch.Tensor,
+        defer_column_gather: bool = False,
+        router_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """With ``defer_column_gather``, returns only this rank's unpooler
-        columns (see :meth:`defers_unpooler`)."""
+        columns (see :meth:`defers_unpooler`). ``router_input``, if given, is
+        the FP32 router input (see :meth:`wants_fp32_router_input`)."""
         num_tokens = hidden_states.shape[0]
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
-        router_logits = self._router_logits(hidden_states)
+        router_logits = self._router_logits(hidden_states, router_input)
         hidden_states = self._pool(hidden_states)
 
         experts_out = self.experts(
@@ -990,6 +1017,12 @@ class MuseSpark1xDecoderLayer(nn.Module):
         With ``reduced=False``, ``attn_out`` is this rank's partial ``o_proj``
         sum, reduced inside the boundary kernel.
         """
+        moe = self.feed_forward
+        router_input = None
+        if isinstance(moe, MuseSpark1xMoE) and moe.wants_fp32_router_input(
+            stream.shape[0]
+        ):
+            router_input = torch.empty_like(stream, dtype=torch.float32)
         if reduced:
             ffn_in, stream = norm_residual_then_norm(
                 MuseSpark1xResidualStream(
@@ -1000,6 +1033,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
                 ),
                 self.pre_ffn_norm,
                 out_dtype=self.default_dtype,
+                router_input=router_input,
             )
         else:
             assert self.attn_all_reduce is not None
@@ -1013,8 +1047,8 @@ class MuseSpark1xDecoderLayer(nn.Module):
                 self.add_attn,
                 self.pre_ffn_norm,
                 self.default_dtype,
+                router_out=router_input,
             )
-        moe = self.feed_forward
         if (
             isinstance(moe, MuseSpark1xMoE)
             and isinstance(self.add_ffn, MuseSpark1xNormPreservingResidualConnection)
@@ -1023,12 +1057,16 @@ class MuseSpark1xDecoderLayer(nn.Module):
             assert moe.column_gather is not None
             return MuseSpark1xColumnShardedStream(
                 stream=stream,
-                branch=moe(ffn_in, defer_column_gather=True),
+                branch=moe(ffn_in, defer_column_gather=True, router_input=router_input),
                 post_norm=self.post_ffn_norm,
                 connection=self.add_ffn,
                 gather=moe.column_gather,
             )
-        branch = self.feed_forward(ffn_in)
+        branch = (
+            moe(ffn_in, router_input=router_input)
+            if isinstance(moe, MuseSpark1xMoE)
+            else moe(ffn_in)
+        )
         return MuseSpark1xResidualStream(
             stream=stream,
             branch=branch,

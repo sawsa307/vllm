@@ -55,6 +55,7 @@ def _all_reduce_boundary_kernel(
     pre_w_ptr,
     alpha_ptr,
     beta_ptr,
+    router_ptr,
     P,
     rank,
     T,
@@ -78,6 +79,7 @@ def _all_reduce_boundary_kernel(
     PRE_INPUT_SCALE: tl.constexpr,
     GATE_STREAM: tl.constexpr,
     PER_CHANNEL: tl.constexpr,
+    ROUTER_OUT: tl.constexpr,
     NUM_WAVES: tl.constexpr,
 ):
     target, buf_off = parity_buffer(P, rank, target_off, buf_elems, LOG2_ARRIVALS)
@@ -127,6 +129,8 @@ def _all_reduce_boundary_kernel(
             PRE_INPUT_SCALE,
             GATE_STREAM,
             PER_CHANNEL,
+            router_ptr,
+            ROUTER_OUT,
         )
     tl.store(peer(P, rank, tl.int32) + target_off + tl.program_id(0), target)
 
@@ -183,11 +187,16 @@ class MuseSparkAllReduceBoundary:
         connection: MuseSpark1xNormPreservingResidualConnection,
         pre_norm: MuseSpark1xRMSNorm,
         out_dtype: torch.dtype,
+        router_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``fused_norm_residual_norm_fwd`` of ``all_reduce(partial)``; returns
-        ``(out, new_stream)``. Collective over TP."""
+        ``(out, new_stream)``. Collective over TP. ``router_out`` (fp32, if
+        given) receives the unrounded pre-norm result."""
         assert self.supports(partial.dtype, stream, post_norm, connection, pre_norm)
         assert partial.shape == stream.shape and partial.stride(-1) == 1
+        if router_out is not None:
+            assert router_out.shape == stream.shape
+            assert router_out.dtype == torch.float32 and router_out.is_contiguous()
         num_tokens, hidden = stream.shape
         alpha, beta = connection.alpha, connection.beta
         gate_stream = isinstance(alpha, torch.Tensor)
@@ -211,6 +220,7 @@ class MuseSparkAllReduceBoundary:
             pre_w if pre_w is not None else stream,
             alpha if gate_stream else beta,
             beta,
+            router_out if router_out is not None else stream,
             self.buffer.peers,
             self.rank,
             num_tokens,
@@ -234,6 +244,7 @@ class MuseSparkAllReduceBoundary:
             PRE_INPUT_SCALE=pre_scale,
             GATE_STREAM=gate_stream,
             PER_CHANNEL=beta.numel() > 1,
+            ROUTER_OUT=router_out is not None,
             NUM_WAVES=num_waves,
             num_warps=num_waves,
         )

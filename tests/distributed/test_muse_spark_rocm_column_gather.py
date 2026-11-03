@@ -320,10 +320,20 @@ def _all_reduce_boundary(monkeypatch, tp_size, pp_size, rank, port):
         for step, n in enumerate((1, 3, 256, 7, 64, 2, 255, 16, 129)):
             partials, stream = inputs(n, 300 + step)
             assert op.supports(partials[rank].dtype, stream, post, connection, pre)
+            router = torch.empty_like(stream) if step % 2 else None
             out, new_stream = op(
-                partials[rank], stream, post, connection, pre, torch.bfloat16
+                partials[rank],
+                stream,
+                post,
+                connection,
+                pre,
+                torch.bfloat16,
+                router_out=router,
             )
             check(out, new_stream, partials, stream)
+            if router is not None:
+                # The unrounded FP32 pre-FFN-norm output, for the router.
+                assert torch.equal(router.bfloat16(), out)
 
         # Graph replay, several calls per graph.
         n = 32

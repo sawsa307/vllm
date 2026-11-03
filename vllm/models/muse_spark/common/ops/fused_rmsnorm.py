@@ -377,9 +377,15 @@ def norm_residual_norm_tile(
     PRE_INPUT_SCALE: tl.constexpr,
     GATE_STREAM: tl.constexpr,
     PER_CHANNEL: tl.constexpr,
+    router_ptr=None,
+    ROUTER_OUT: tl.constexpr = False,
 ):
     """One residual boundary of the loaded fp32 branch tile ``x``: post-norm,
-    gated add, and the next pre-norm; ``idx`` addresses the ``[T, D]`` rows."""
+    gated add, and the next pre-norm; ``idx`` addresses the ``[T, D]`` rows.
+
+    With ``ROUTER_OUT``, the pre-norm result is also stored unrounded (fp32) to
+    ``router_ptr``, for an MoE router that reads FP32 input.
+    """
     # All loads before the first reduction: at decode this is latency-bound.
     stream = tl.load(stream_ptr + idx, mask=mask, other=0.0).to(tl.float32)
     if PER_CHANNEL:
@@ -422,6 +428,8 @@ def norm_residual_norm_tile(
         z = z * pre_w[None, :]
 
     tl.store(out_ptr + idx, z.to(out_ptr.dtype.element_ty), mask=mask)
+    if ROUTER_OUT:
+        tl.store(router_ptr + idx, z, mask=mask)
 
 
 @triton.jit(do_not_specialize_on_alignment=["T"])
@@ -434,6 +442,7 @@ def _norm_residual_norm_fwd_kernel(
     pre_w_ptr,
     alpha_ptr,
     beta_ptr,
+    router_ptr,
     T,
     D: tl.constexpr,
     post_eps,
@@ -447,6 +456,7 @@ def _norm_residual_norm_fwd_kernel(
     PRE_INPUT_SCALE: tl.constexpr,
     GATE_STREAM: tl.constexpr,
     PER_CHANNEL: tl.constexpr,
+    ROUTER_OUT: tl.constexpr,
     bT: tl.constexpr,
     bD: tl.constexpr,
 ):
@@ -483,6 +493,8 @@ def _norm_residual_norm_fwd_kernel(
         PRE_INPUT_SCALE,
         GATE_STREAM,
         PER_CHANNEL,
+        router_ptr,
+        ROUTER_OUT,
     )
 
 
@@ -517,8 +529,12 @@ def fused_norm_residual_norm_fwd(
     post_input_scale: bool = False,
     pre_input_scale: bool = False,
     out_dtype: torch.dtype | None = None,
+    router_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """A whole residual boundary in one kernel.
+
+    If supplied, ``router_out`` (fp32, the shape of ``stream``) receives the
+    unrounded pre-norm result.
 
     Computes, in fp32::
 
@@ -567,6 +583,10 @@ def fused_norm_residual_norm_fwd(
     else:
         alpha_scalar = float(alpha)
 
+    if router_out is not None:
+        assert router_out.dtype == torch.float32 and router_out.is_contiguous()
+        router_out = router_out.view(-1, D)
+        assert router_out.shape == (T, D)
     out = torch.empty_like(branch, dtype=out_dtype)
     new_stream = torch.empty_like(stream)
 
@@ -590,6 +610,7 @@ def fused_norm_residual_norm_fwd(
         pre_weight if pre_weight is not None else branch,
         alpha if gate_stream else beta,
         beta,
+        router_out if router_out is not None else stream,
         T,
         D=D,
         post_eps=post_eps,
@@ -603,6 +624,7 @@ def fused_norm_residual_norm_fwd(
         PRE_INPUT_SCALE=pre_input_scale,
         GATE_STREAM=gate_stream,
         PER_CHANNEL=per_channel,
+        ROUTER_OUT=router_out is not None,
         bT=bT,
         bD=bD,
         num_warps=num_warps,

@@ -180,6 +180,41 @@ def test_triton_residual_boundary_matches_native(monkeypatch, rows, post_input_s
     torch.testing.assert_close(actual_stream, expected_stream, rtol=1e-5, atol=1e-5)
 
 
+@requires_cuda
+@pytest.mark.parametrize("rows", [1, 64, 256])
+def test_triton_residual_boundary_router_out_is_the_unrounded_pre_norm(rows):
+    """The FP32 router input rounds to the boundary output, and asking for it
+    changes neither output."""
+    torch.manual_seed(0)
+    boundary, pre_norm = make_residual_boundary(rows, post_input_scale=True)
+    args = (
+        boundary.branch,
+        boundary.stream,
+        boundary.post_norm.weight,
+        pre_norm.weight,
+        boundary.post_norm.variance_epsilon,
+        pre_norm.variance_epsilon,
+    )
+    kwargs = dict(
+        alpha=boundary.connection.alpha,
+        beta=boundary.connection.beta,
+        post_gain_center=boundary.post_norm.fused_gain_center,
+        pre_gain_center=pre_norm.fused_gain_center,
+        post_input_scale=True,
+        out_dtype=torch.bfloat16,
+    )
+    out, stream = fused_rmsnorm_ops.fused_norm_residual_norm_fwd(*args, **kwargs)
+    router = torch.empty_like(boundary.stream)
+    out_r, stream_r = fused_rmsnorm_ops.fused_norm_residual_norm_fwd(
+        *args, **kwargs, router_out=router
+    )
+    assert torch.equal(out_r, out) and torch.equal(stream_r, stream)
+    assert torch.equal(router.bfloat16(), out)
+    torch.testing.assert_close(
+        router.double(), reference(pre_norm, stream_r), rtol=1e-5, atol=1e-5
+    )
+
+
 @requires_b300_dual_norm
 @pytest.mark.parametrize("rows", [0, 128])
 @pytest.mark.parametrize("post_input_scale", [False, True])
