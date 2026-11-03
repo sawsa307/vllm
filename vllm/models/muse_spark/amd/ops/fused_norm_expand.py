@@ -12,6 +12,34 @@ _EXPANDED_ATTR = "_muse_route_expanded"
 
 
 @triton.jit
+def rmsnorm_expand_row(
+    x,
+    w_ptr,
+    out_ptr,
+    t,
+    d,
+    dm,
+    D: tl.constexpr,
+    eps,
+    gain_center,
+    REPEATS: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+    INPUT_SCALE: tl.constexpr,
+):
+    """Normalize the fp32 row ``x`` of token ``t``; store it ``REPEATS`` times."""
+    if HAS_WEIGHT:
+        w = tl.load(w_ptr + d, mask=dm, other=0.0).to(tl.float32) + gain_center
+        if INPUT_SCALE:
+            x = x * w
+    y = x * tl.rsqrt(tl.sum(x * x, axis=0) * (1.0 / D) + eps)
+    if HAS_WEIGHT and not INPUT_SCALE:
+        y = y * w
+    y = y.to(out_ptr.dtype.element_ty)
+    for r in tl.static_range(REPEATS):
+        tl.store(out_ptr + (t * REPEATS + r) * D + d, y, mask=dm)
+
+
+@triton.jit
 def _rmsnorm_expand_kernel(
     x_ptr,
     w_ptr,
@@ -28,16 +56,20 @@ def _rmsnorm_expand_kernel(
     d = tl.arange(0, BLOCK_D)
     dm = d < D
     x = tl.load(x_ptr + t * D + d, mask=dm, other=0.0).to(tl.float32)
-    if HAS_WEIGHT:
-        w = tl.load(w_ptr + d, mask=dm, other=0.0).to(tl.float32) + gain_center
-        if INPUT_SCALE:
-            x = x * w
-    y = x * tl.rsqrt(tl.sum(x * x, axis=0) * (1.0 / D) + eps)
-    if HAS_WEIGHT and not INPUT_SCALE:
-        y = y * w
-    y = y.to(out_ptr.dtype.element_ty)
-    for r in tl.static_range(REPEATS):
-        tl.store(out_ptr + (t * REPEATS + r) * D + d, y, mask=dm)
+    rmsnorm_expand_row(
+        x,
+        w_ptr,
+        out_ptr,
+        t,
+        d,
+        dm,
+        D,
+        eps,
+        gain_center,
+        REPEATS,
+        HAS_WEIGHT,
+        INPUT_SCALE,
+    )
 
 
 def fused_rmsnorm_expand(
@@ -67,6 +99,12 @@ def fused_rmsnorm_expand(
             INPUT_SCALE=input_scale and weight is not None,
             num_warps=8 if block_d >= 4096 else 4,
         )
+    return as_expanded(out)
+
+
+def as_expanded(out: torch.Tensor) -> torch.Tensor:
+    """The first-route ``[T, D]`` view of ``out`` (``[T, repeats, D]``), tagged
+    for :func:`take_expanded`."""
     first = out[:, 0]
     setattr(first, _EXPANDED_ATTR, out)
     return first

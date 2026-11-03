@@ -5,6 +5,7 @@
 import functools
 import math
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -15,6 +16,7 @@ from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
@@ -74,7 +76,11 @@ from .muse_moe_runner import (
     MuseMoERunner,
     MuseSparkQuarkOCPMXFusedMoE,
     MuseSparkRoutedExperts,
+    aiter_returns_per_slot_routes,
+    per_slot_routes_for_batch,
 )
+from .ops.column_gather import MuseSparkColumnGather, maybe_create_column_gather
+from .ops.fused_finalize_all_reduce import maybe_create_finalize_all_reduce
 from .ops.fused_norm_expand import fused_rmsnorm_expand
 from .ops.fused_qk_norm_rope_kv import rocm_fused_qk_norm_rope_kv_insert
 from .ops.router_bf16x3 import (
@@ -99,6 +105,28 @@ def _supports_router_bf16x3_device() -> bool:
     return on_gfx950()
 
 
+@dataclass(slots=True)
+class MuseSpark1xColumnShardedStream(MuseSpark1xResidualStream):
+    """A deferred boundary whose branch is still this rank's column block."""
+
+    gather: MuseSparkColumnGather
+
+    def materialize(self) -> MuseSpark1xResidualStream:
+        return MuseSpark1xResidualStream(
+            stream=self.stream,
+            branch=tensor_model_parallel_all_gather(self.branch, dim=-1),
+            post_norm=self.post_norm,
+            connection=self.connection,
+        )
+
+
+def materialize(x: MuseSpark1xResidualStream) -> MuseSpark1xResidualStream:
+    """``x`` with its branch gathered, if it is a column block."""
+    if isinstance(x, MuseSpark1xColumnShardedStream):
+        return x.materialize()
+    return x
+
+
 def norm_residual_then_norm(
     x: MuseSpark1xResidualStream,
     pre_norm: MuseSpark1xRMSNorm,
@@ -106,6 +134,15 @@ def norm_residual_then_norm(
     out_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Post-norm, blend and pre-norm in one kernel; returns ``(out, new_stream)``."""
+    if isinstance(x, MuseSpark1xColumnShardedStream):
+        if x.gather.supports_boundary(
+            x.branch, x.stream, x.post_norm, x.connection, pre_norm
+        ):
+            assert isinstance(x.connection, MuseSpark1xNormPreservingResidualConnection)
+            return x.gather.gather_boundary(
+                x.branch, x.stream, x.post_norm, x.connection, pre_norm, out_dtype
+            )
+        x = x.materialize()
     post_norm, connection = x.post_norm, x.connection
     branch, stream = x.branch, x.stream
     if (
@@ -246,6 +283,14 @@ class MuseSpark1xMoE(nn.Module):
             self.pre_expert_norm = None
 
         self.intermediate_size = config.moe_intermediate_size
+        self.column_gather = None
+        if self.tp_size > 1:
+            maybe_create_finalize_all_reduce(
+                vllm_config, config.num_experts_per_tok, hidden_size
+            )
+            self.column_gather = maybe_create_column_gather(
+                vllm_config, max(config.hidden_size, hidden_size)
+            )
 
         self.post_expert_norm: MuseSpark1xRMSNorm | None = (
             MuseSpark1xRMSNormWithInputScale(
@@ -332,11 +377,58 @@ class MuseSpark1xMoE(nn.Module):
             )
         )
 
+    def _local_columns(self, layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        """This rank's block of ``layer``'s output columns (full weights)."""
+        rows = layer.weight.shape[0] // self.tp_size
+        start = get_tensor_model_parallel_rank() * rows
+        return F.linear(x, layer.weight[start : start + rows])
+
+    def _gathers(self, layer: nn.Module | None, x: torch.Tensor) -> bool:
+        """Whether ``layer`` runs column-sharded, gathered by the next norm."""
+        return (
+            layer is not None
+            and self.column_gather is not None
+            and self.column_gather.supports(x.shape[0], layer.weight.shape[0], x.dtype)
+        )
+
+    def defers_unpooler(self, hidden_states: torch.Tensor) -> bool:
+        """Whether the unpooler's column gather can be left to the boundary."""
+        return not self.is_sequence_parallel and self._gathers(
+            self.unpooler, hidden_states
+        )
+
+    @functools.cached_property
+    def _experts_route_per_slot(self) -> bool:
+        return aiter_returns_per_slot_routes()
+
+    @functools.cached_property
+    def _experts_use_ep(self) -> bool:
+        return self.experts.routed_experts.moe_config.moe_parallel_config.use_ep
+
     def _pool(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.pooler is None:
             return hidden_states
-        hidden_states, _ = self.pooler(hidden_states)
         norm = self.pre_expert_norm
+        # AITER MXFP4 experts take one input row per route, unless they return
+        # their per-route rows directly (per-slot routes).
+        expand = self._experts_take_expanded_input and not (
+            self._experts_route_per_slot
+            and per_slot_routes_for_batch(
+                hidden_states.shape[0], self.top_k, self._experts_use_ep
+            )
+        )
+        if (
+            norm is not None
+            and norm.variance_size_override is None
+            and self._gathers(self.pooler, hidden_states)
+        ):
+            assert self.column_gather is not None
+            return self.column_gather.gather_rmsnorm(
+                self._local_columns(self.pooler, hidden_states),
+                norm,
+                self.top_k if expand else 1,
+            )
+        hidden_states, _ = self.pooler(hidden_states)
         if norm is None:
             return hidden_states
         if self._experts_take_expanded_input and hidden_states.is_contiguous():
@@ -346,11 +438,15 @@ class MuseSpark1xMoE(nn.Module):
                 norm.variance_epsilon,
                 norm.fused_gain_center,
                 norm.applies_weight_before_norm and norm.has_weight,
-                self.top_k,
+                self.top_k if expand else 1,
             )
         return norm(hidden_states)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, defer_column_gather: bool = False
+    ) -> torch.Tensor:
+        """With ``defer_column_gather``, returns only this rank's unpooler
+        columns (see :meth:`defers_unpooler`)."""
         num_tokens = hidden_states.shape[0]
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
@@ -363,6 +459,9 @@ class MuseSpark1xMoE(nn.Module):
             router_logits=router_logits,
         )
 
+        if defer_column_gather:
+            assert self.unpooler is not None
+            return self._local_columns(self.unpooler, experts_out)
         if self.unpooler is not None:
             experts_out, _ = self.unpooler(experts_out)
 
@@ -864,6 +963,20 @@ class MuseSpark1xDecoderLayer(nn.Module):
             self.pre_ffn_norm,
             out_dtype=self.default_dtype,
         )
+        moe = self.feed_forward
+        if (
+            isinstance(moe, MuseSpark1xMoE)
+            and isinstance(self.add_ffn, MuseSpark1xNormPreservingResidualConnection)
+            and moe.defers_unpooler(ffn_in)
+        ):
+            assert moe.column_gather is not None
+            return MuseSpark1xColumnShardedStream(
+                stream=stream,
+                branch=moe(ffn_in, defer_column_gather=True),
+                post_norm=self.post_ffn_norm,
+                connection=self.add_ffn,
+                gather=moe.column_gather,
+            )
         branch = self.feed_forward(ffn_in)
         return MuseSpark1xResidualStream(
             stream=stream,
@@ -978,8 +1091,10 @@ class MuseSpark1xModel(LlamaModel):
         ):
             x = layer(positions, x)
             if not self.fuse_across_layers and isinstance(x, MuseSpark1xResidualStream):
-                x = norm_then_gated_residual(x)
+                x = norm_then_gated_residual(materialize(x))
             if idx + 1 in self.aux_hidden_state_layers:
+                if isinstance(x, MuseSpark1xResidualStream):
+                    x = materialize(x)
                 state = (
                     norm_then_gated_residual(x)
                     if isinstance(x, MuseSpark1xResidualStream)
@@ -1222,6 +1337,7 @@ __all__ = [
     "MuseSpark1xDecoderLayer",
     "MuseSpark1xForCausalLM",
     "MuseSpark1xMoE",
+    "MuseSpark1xColumnShardedStream",
     "MuseSpark1xModel",
     "MuseSparkTorchLinearMethod",
     "norm_residual_then_norm",

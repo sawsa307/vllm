@@ -351,9 +351,9 @@ def fused_rmsnorm_fwd(
 _BOUNDARY_TILE_ELEMS = 8192
 
 
-@triton.jit(do_not_specialize_on_alignment=["T"])
-def _norm_residual_norm_fwd_kernel(
-    branch_ptr,
+@triton.jit
+def norm_residual_norm_tile(
+    x,
     stream_ptr,
     new_stream_ptr,
     out_ptr,
@@ -361,7 +361,10 @@ def _norm_residual_norm_fwd_kernel(
     pre_w_ptr,
     alpha_ptr,
     beta_ptr,
-    T,
+    idx,
+    d,
+    dm,
+    mask,
     D: tl.constexpr,
     post_eps,
     pre_eps,
@@ -374,19 +377,10 @@ def _norm_residual_norm_fwd_kernel(
     PRE_INPUT_SCALE: tl.constexpr,
     GATE_STREAM: tl.constexpr,
     PER_CHANNEL: tl.constexpr,
-    bT: tl.constexpr,
-    bD: tl.constexpr,
 ):
-    """One residual boundary: post-norm, gated add, and the next pre-norm."""
-    t = tl.program_id(0) * bT + tl.arange(0, bT)
-    tm = t < T
-    d = tl.arange(0, bD)
-    dm = d < D
-    idx = t[:, None] * D + d[None, :]
-    mask = tm[:, None] & dm[None, :]
-
+    """One residual boundary of the loaded fp32 branch tile ``x``: post-norm,
+    gated add, and the next pre-norm; ``idx`` addresses the ``[T, D]`` rows."""
     # All loads before the first reduction: at decode this is latency-bound.
-    x = tl.load(branch_ptr + idx, mask=mask, other=0.0).to(tl.float32)
     stream = tl.load(stream_ptr + idx, mask=mask, other=0.0).to(tl.float32)
     if PER_CHANNEL:
         beta = tl.load(beta_ptr + d, mask=dm, other=0.0)[None, :]
@@ -428,6 +422,68 @@ def _norm_residual_norm_fwd_kernel(
         z = z * pre_w[None, :]
 
     tl.store(out_ptr + idx, z.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+@triton.jit(do_not_specialize_on_alignment=["T"])
+def _norm_residual_norm_fwd_kernel(
+    branch_ptr,
+    stream_ptr,
+    new_stream_ptr,
+    out_ptr,
+    post_w_ptr,
+    pre_w_ptr,
+    alpha_ptr,
+    beta_ptr,
+    T,
+    D: tl.constexpr,
+    post_eps,
+    pre_eps,
+    post_gain_center,
+    pre_gain_center,
+    alpha_scalar,
+    POST_HAS_WEIGHT: tl.constexpr,
+    POST_INPUT_SCALE: tl.constexpr,
+    PRE_HAS_WEIGHT: tl.constexpr,
+    PRE_INPUT_SCALE: tl.constexpr,
+    GATE_STREAM: tl.constexpr,
+    PER_CHANNEL: tl.constexpr,
+    bT: tl.constexpr,
+    bD: tl.constexpr,
+):
+    """One residual boundary: post-norm, gated add, and the next pre-norm."""
+    t = tl.program_id(0) * bT + tl.arange(0, bT)
+    tm = t < T
+    d = tl.arange(0, bD)
+    dm = d < D
+    idx = t[:, None] * D + d[None, :]
+    mask = tm[:, None] & dm[None, :]
+    x = tl.load(branch_ptr + idx, mask=mask, other=0.0).to(tl.float32)
+    norm_residual_norm_tile(
+        x,
+        stream_ptr,
+        new_stream_ptr,
+        out_ptr,
+        post_w_ptr,
+        pre_w_ptr,
+        alpha_ptr,
+        beta_ptr,
+        idx,
+        d,
+        dm,
+        mask,
+        D,
+        post_eps,
+        pre_eps,
+        post_gain_center,
+        pre_gain_center,
+        alpha_scalar,
+        POST_HAS_WEIGHT,
+        POST_INPUT_SCALE,
+        PRE_HAS_WEIGHT,
+        PRE_INPUT_SCALE,
+        GATE_STREAM,
+        PER_CHANNEL,
+    )
 
 
 def supports_norm_residual_norm(
