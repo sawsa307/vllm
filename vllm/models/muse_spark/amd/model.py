@@ -79,6 +79,7 @@ from .muse_moe_runner import (
     aiter_returns_per_slot_routes,
     per_slot_routes_for_batch,
 )
+from .ops.all_reduce_boundary import maybe_create_all_reduce_boundary
 from .ops.column_gather import MuseSparkColumnGather, maybe_create_column_gather
 from .ops.fused_finalize_all_reduce import maybe_create_finalize_all_reduce
 from .ops.fused_norm_expand import fused_rmsnorm_expand
@@ -754,8 +755,13 @@ class MuseSpark1xAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        reduce_output: bool = True,
     ) -> torch.Tensor:
-        """Attention over an input the caller has already normalized."""
+        """Attention over an input the caller has already normalized.
+
+        Without ``reduce_output``, returns this rank's partial ``o_proj`` sum;
+        the caller must reduce it exactly once.
+        """
         qkv, _ = self.qkv_proj(hidden_states)
 
         q, k, v, og = self._qk_norm_rope_kv_insert(qkv, positions)
@@ -765,9 +771,14 @@ class MuseSpark1xAttention(nn.Module):
             attn_output = self.attn(q, None, None)
         else:
             attn_output = self.attn(q, k, v)
-        return self.back(attn_output, og)
+        return self.back(attn_output, og, reduce_output)
 
-    def back(self, attn_output: torch.Tensor, og: torch.Tensor | None) -> torch.Tensor:
+    def back(
+        self,
+        attn_output: torch.Tensor,
+        og: torch.Tensor | None,
+        reduce_output: bool = True,
+    ) -> torch.Tensor:
         """O-norm, O-gate and the output projection."""
         if self.fuse_o_norm_gate:
             assert og is not None
@@ -794,6 +805,10 @@ class MuseSpark1xAttention(nn.Module):
                 attn_output = og.sigmoid() * attn_output
 
         attn_output = attn_output.view(-1, self.num_heads * self.head_dim)
+        if not reduce_output:
+            o_proj = self.o_proj
+            assert o_proj.input_is_parallel and o_proj.bias is None
+            return o_proj.quant_method.apply(o_proj, attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -908,6 +923,11 @@ class MuseSpark1xDecoderLayer(nn.Module):
             output_norm_gain_center_type=output_gain_center_type,
         )
         self.residual_dtype = config.residual_dtype if is_draft else torch.float32
+        self.attn_all_reduce = (
+            maybe_create_all_reduce_boundary(vllm_config, config.hidden_size)
+            if not is_draft and get_tensor_model_parallel_world_size() > 1
+            else None
+        )
         self.default_dtype = torch.get_default_dtype()
 
         if not is_draft or config.use_residual_gate:
@@ -946,23 +966,54 @@ class MuseSpark1xDecoderLayer(nn.Module):
             )
         assert stream.dtype == self.residual_dtype
 
-        attn_out = self.self_attn(positions=positions, hidden_states=attn_input)
-        return self.after_attention(stream, attn_out)
+        reduce = not self._fuses_attn_reduction(stream)
+        attn_out = self.self_attn(
+            positions=positions, hidden_states=attn_input, reduce_output=reduce
+        )
+        return self.after_attention(stream, attn_out, reduced=reduce)
+
+    def _fuses_attn_reduction(self, stream: torch.Tensor) -> bool:
+        """Whether the attention boundary kernel reduces ``o_proj`` itself."""
+        return self.attn_all_reduce is not None and self.attn_all_reduce.supports(
+            self.default_dtype,
+            stream,
+            self.post_attn_norm,
+            self.add_attn,
+            self.pre_ffn_norm,
+        )
 
     def after_attention(
-        self, stream: torch.Tensor, attn_out: torch.Tensor
+        self, stream: torch.Tensor, attn_out: torch.Tensor, reduced: bool = True
     ) -> MuseSpark1xResidualStream:
-        """Attention boundary and FFN; the FFN boundary is returned unblended."""
-        ffn_in, stream = norm_residual_then_norm(
-            MuseSpark1xResidualStream(
-                stream=stream,
-                branch=attn_out,
-                post_norm=self.post_attn_norm,
-                connection=self.add_attn,
-            ),
-            self.pre_ffn_norm,
-            out_dtype=self.default_dtype,
-        )
+        """Attention boundary and FFN; the FFN boundary is returned unblended.
+
+        With ``reduced=False``, ``attn_out`` is this rank's partial ``o_proj``
+        sum, reduced inside the boundary kernel.
+        """
+        if reduced:
+            ffn_in, stream = norm_residual_then_norm(
+                MuseSpark1xResidualStream(
+                    stream=stream,
+                    branch=attn_out,
+                    post_norm=self.post_attn_norm,
+                    connection=self.add_attn,
+                ),
+                self.pre_ffn_norm,
+                out_dtype=self.default_dtype,
+            )
+        else:
+            assert self.attn_all_reduce is not None
+            assert isinstance(
+                self.add_attn, MuseSpark1xNormPreservingResidualConnection
+            )
+            ffn_in, stream = self.attn_all_reduce(
+                attn_out,
+                stream,
+                self.post_attn_norm,
+                self.add_attn,
+                self.pre_ffn_norm,
+                self.default_dtype,
+            )
         moe = self.feed_forward
         if (
             isinstance(moe, MuseSpark1xMoE)

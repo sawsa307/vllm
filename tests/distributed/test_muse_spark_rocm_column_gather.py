@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Muse Spark ROCm column-sharded projection gathers against the unfused path."""
+"""Muse Spark ROCm projection collectives fused into norms, against the unfused path:
+the column-sharded MoE projection gathers and the attention all-reduce."""
 
 import pytest
 import ray
@@ -228,6 +229,129 @@ def _gather_boundary(monkeypatch, tp_size, pp_size, rank, port):
                 assert torch.equal(out, ref_out)
                 assert torch.equal(new_stream, ref_stream)
         gather.close()
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def _all_reduce_boundary(monkeypatch, tp_size, pp_size, rank, port):
+    """Partial o_proj rows reduced inside the attention residual boundary."""
+    from vllm.distributed import get_tp_group, tensor_model_parallel_all_reduce
+    from vllm.models.muse_spark.amd.ops.all_reduce_boundary import (
+        MuseSparkAllReduceBoundary,
+    )
+    from vllm.models.muse_spark.common.layers import (
+        MuseSpark1xNormPreservingResidualConnection,
+        MuseSpark1xRMSNorm,
+    )
+    from vllm.models.muse_spark.common.ops.fused_rmsnorm import (
+        fused_norm_residual_norm_fwd,
+    )
+
+    with monkeypatch.context() as m:
+        m.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        device = torch.device(f"cuda:{rank}")
+        torch.accelerator.set_device_index(device)
+        init_test_distributed_environment(tp_size, pp_size, rank, port)
+        ensure_model_parallel_initialized(tp_size, pp_size)
+        group = get_tp_group()
+        op = MuseSparkAllReduceBoundary(256, HIDDEN, group.cpu_group)
+        # The target decoder's post-attention norm (no weight), gate and
+        # pre-FFN norm.
+        post = MuseSpark1xRMSNorm(
+            HIDDEN, eps=1e-5, has_weight=False, is_post_norm=True, residual_id=3
+        ).to(device)
+        pre = MuseSpark1xRMSNorm(
+            HIDDEN,
+            eps=1e-5,
+            has_weight=True,
+            zero_centered_gamma=True,
+            residual_id=4,
+            output_norm_gain_center_type="zero",
+        ).to(device)
+        connection = MuseSpark1xNormPreservingResidualConnection(HIDDEN).to(device)
+        with torch.no_grad():
+            pre.weight.copy_(torch.linspace(0.2, -0.2, HIDDEN))
+            connection.gate.copy_(torch.linspace(-2.0, 2.0, HIDDEN))
+        connection.materialize_coefficients()
+
+        def boundary(branch, stream):
+            return fused_norm_residual_norm_fwd(
+                branch,
+                stream,
+                None,
+                pre.weight,
+                post.variance_epsilon,
+                pre.variance_epsilon,
+                alpha=connection.alpha,
+                beta=connection.beta,
+                pre_gain_center=pre.fused_gain_center,
+                out_dtype=torch.bfloat16,
+            )
+
+        def inputs(n, seed):
+            gen = torch.Generator(device=device).manual_seed(seed)
+            partials = [
+                torch.randn(n, HIDDEN, device=device, generator=gen).bfloat16()
+                for _ in range(tp_size)
+            ]
+            stream = torch.randn(n, HIDDEN, device=device, generator=gen)
+            return partials, stream
+
+        def check(out, new_stream, partials, stream):
+            # fp32 sum in rank order, rounded once: bit-identical boundary.
+            total = partials[0].float()
+            for p in partials[1:]:
+                total = total + p.float()
+            ref_out, ref_stream = boundary(total.bfloat16(), stream)
+            assert torch.equal(out, ref_out)
+            assert torch.equal(new_stream, ref_stream)
+            # The production all-reduce sums in its own order: close only.
+            ar = tensor_model_parallel_all_reduce(partials[rank].clone())
+            ar_out, ar_stream = boundary(ar, stream)
+            torch.testing.assert_close(new_stream, ar_stream, atol=2e-2, rtol=2e-2)
+            torch.testing.assert_close(
+                out.float(), ar_out.float(), atol=5e-2, rtol=5e-2
+            )
+            # The replicated stream must stay identical on every rank.
+            gathered = [torch.empty_like(new_stream) for _ in range(tp_size)]
+            dist.all_gather(gathered, new_stream, group=group.device_group)
+            for other in gathered:
+                assert torch.equal(other, new_stream)
+
+        for step, n in enumerate((1, 3, 256, 7, 64, 2, 255, 16, 129)):
+            partials, stream = inputs(n, 300 + step)
+            assert op.supports(partials[rank].dtype, stream, post, connection, pre)
+            out, new_stream = op(
+                partials[rank], stream, post, connection, pre, torch.bfloat16
+            )
+            check(out, new_stream, partials, stream)
+
+        # Graph replay, several calls per graph.
+        n = 32
+        static_partial = torch.zeros(n, HIDDEN, dtype=torch.bfloat16, device=device)
+        static_stream = torch.zeros(n, HIDDEN, device=device)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            results = [
+                op(static_partial, static_stream, post, connection, pre, torch.bfloat16)
+                for _ in range(3)
+            ]
+        for seed in range(10):
+            partials, stream = inputs(n, 3000 + seed)
+            static_partial.copy_(partials[rank])
+            static_stream.copy_(stream)
+            graph.replay()
+            torch.accelerator.synchronize()
+            for out, new_stream in results:
+                check(out, new_stream, partials, stream)
+        op.close()
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-only kernel")
+@pytest.mark.parametrize("tp_size", [2, 4, 8])
+def test_all_reduce_boundary_matches_unfused(monkeypatch, tp_size):
+    if torch.accelerator.device_count() < tp_size:
+        pytest.skip(f"Requires {tp_size} GPUs")
+    multi_process_parallel(monkeypatch, tp_size, 1, _all_reduce_boundary)
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-only kernel")
