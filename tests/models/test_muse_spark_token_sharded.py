@@ -6,6 +6,7 @@ Ported from vllm-project/vllm#63722 and #63723 (Mikko Tukiainen), plus the
 small-batch reduction with the fused finalize in front of it.
 """
 
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -209,6 +210,48 @@ def _check_token_sharded(rank: int, config: VllmConfig) -> None:
         torch.testing.assert_close(actual, expected, atol=0.002, rtol=0.02)
 
 
+def _require_aiter_comm() -> bool:
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    comm = rocm_aiter_ops.get_aiter_allreduce()
+    return comm is not None and not comm.disabled
+
+
+def _check_aiter_token_collectives(rank: int, config: VllmConfig) -> None:
+    """AITER token collectives, single- and multi-chunk, match RCCL."""
+    from vllm.distributed import tensor_model_parallel_reduce_scatter
+    from vllm.models.muse_spark.amd.ops import token_collectives
+
+    if not _require_aiter_comm():
+        return
+    os.environ["VLLM_ROCM_MUSE_AITER_TOKEN_COLLECTIVES"] = "1"
+    for chunked in (False, True):
+        # Force small chunks to cover the strided multi-chunk paths.
+        chunk = (lambda rows, fits: min(rows, 3)) if chunked else None
+        with patch.object(
+            token_collectives, "_chunk_rows", chunk or token_collectives._chunk_rows
+        ):
+            for rows in (1, 5, 64, 301):
+                torch.manual_seed(rows)
+                x = torch.randn(rows, HIDDEN_SIZE).to(torch.bfloat16)
+                expected = tensor_model_parallel_all_gather(x, 0)
+                assert torch.equal(token_collectives.all_gather_tokens(x), expected)
+                y = torch.randn(2 * rows, HIDDEN_SIZE).to(torch.bfloat16)
+                torch.testing.assert_close(
+                    token_collectives.reduce_scatter_tokens(y),
+                    tensor_model_parallel_reduce_scatter(y, 0),
+                    atol=0.02,
+                    rtol=0.02,
+                )
+
+
+def _check_token_sharded_aiter(rank: int, config: VllmConfig) -> None:
+    if not _require_aiter_comm():
+        return
+    os.environ["VLLM_ROCM_MUSE_AITER_TOKEN_COLLECTIVES"] = "1"
+    _check_token_sharded(rank, config)
+
+
 def _run(rank: int, port: int, check) -> None:
     torch.accelerator.set_device_index(rank)
     torch.set_num_threads(1)
@@ -247,3 +290,16 @@ def test_token_sharded_decoder_layers_match_full_tokens() -> None:
 def test_small_batch_moe_block_reduces_exactly_once() -> None:
     """With or without the fused EP finalize, small batches reduce once."""
     mp.spawn(_run, args=(get_open_port(), _check_small_batch_reduces_once), nprocs=2)
+
+
+@multi_gpu_test(num_gpus=2)
+def test_aiter_token_collectives_match_rccl() -> None:
+    """The AITER token all-gather / reduce-scatter match RCCL (skips without
+    an AITER custom all-reduce)."""
+    mp.spawn(_run, args=(get_open_port(), _check_aiter_token_collectives), nprocs=2)
+
+
+@multi_gpu_test(num_gpus=2)
+def test_token_sharded_layers_match_full_tokens_with_aiter_collectives() -> None:
+    """The token-sharded layers with AITER collectives match full tokens."""
+    mp.spawn(_run, args=(get_open_port(), _check_token_sharded_aiter), nprocs=2)

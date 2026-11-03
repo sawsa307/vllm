@@ -147,6 +147,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_MUSE_FUSED_ATTN_ALL_REDUCE: bool = True
     VLLM_ROCM_MUSE_FP32_ROUTER_INPUT: bool = False
     VLLM_ROCM_MUSE_TOKEN_SHARDED: bool = True
+    VLLM_ROCM_MUSE_AITER_TOKEN_COLLECTIVES: bool = False
     VLLM_ROCM_MUSE_MOE_ROUTE_MODE: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
@@ -1359,6 +1360,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # residual stream split over tokens for batches of 256+ tokens.
     "VLLM_ROCM_MUSE_TOKEN_SHARDED": lambda: (
         os.getenv("VLLM_ROCM_MUSE_TOKEN_SHARDED", "1").lower() in ("true", "1")
+    ),
+    # Muse Spark on ROCm, token-sharded stream (experimental, off by default):
+    # run its token all-gathers and reduce-scatters through AITER's custom
+    # collectives, in chunks that fit their IPC buffer, instead of RCCL.
+    "VLLM_ROCM_MUSE_AITER_TOKEN_COLLECTIVES": lambda: (
+        os.getenv("VLLM_ROCM_MUSE_AITER_TOKEN_COLLECTIVES", "0").lower()
+        in ("true", "1")
     ),
     # Muse Spark on ROCm: take the AITER MXFP4 experts' per-route rows from
     # fused_moe(per_slot_output=) when the installed AITER has it, instead of
