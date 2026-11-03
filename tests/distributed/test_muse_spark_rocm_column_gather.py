@@ -317,7 +317,9 @@ def _all_reduce_boundary(monkeypatch, tp_size, pp_size, rank, port):
             for other in gathered:
                 assert torch.equal(other, new_stream)
 
-        for step, n in enumerate((1, 3, 256, 7, 64, 2, 255, 16, 129)):
+        # One-shot up to 32 tokens, two-shot above; every third call forces
+        # two-shot (also below the world size). Both give the same bits.
+        for step, n in enumerate((1, 3, 256, 7, 64, 2, 255, 16, 129, 32, 33, 5)):
             partials, stream = inputs(n, 300 + step)
             assert op.supports(partials[rank].dtype, stream, post, connection, pre)
             router = torch.empty_like(stream) if step % 2 else None
@@ -329,21 +331,30 @@ def _all_reduce_boundary(monkeypatch, tp_size, pp_size, rank, port):
                 pre,
                 torch.bfloat16,
                 router_out=router,
+                two_shot=True if step % 3 == 0 else None,
             )
             check(out, new_stream, partials, stream)
             if router is not None:
                 # The unrounded FP32 pre-FFN-norm output, for the router.
                 assert torch.equal(router.bfloat16(), out)
 
-        # Graph replay, several calls per graph.
+        # Graph replay, several calls of both variants per graph.
         n = 32
         static_partial = torch.zeros(n, HIDDEN, dtype=torch.bfloat16, device=device)
         static_stream = torch.zeros(n, HIDDEN, device=device)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             results = [
-                op(static_partial, static_stream, post, connection, pre, torch.bfloat16)
-                for _ in range(3)
+                op(
+                    static_partial,
+                    static_stream,
+                    post,
+                    connection,
+                    pre,
+                    torch.bfloat16,
+                    two_shot=two_shot,
+                )
+                for two_shot in (False, True, True, False)
             ]
         for seed in range(10):
             partials, stream = inputs(n, 3000 + seed)

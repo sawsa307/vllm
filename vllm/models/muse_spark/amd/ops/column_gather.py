@@ -405,6 +405,7 @@ def maybe_create_column_gather(
     # every TP rank.
     if (
         not envs.VLLM_ROCM_MUSE_SHARD_PROJECTIONS
+        or envs.VLLM_ROCM_MUSE_SHARD_PROJECTIONS_MAX_TOKENS < 1
         or pc.use_sequence_parallel_moe
         or pc.data_parallel_size != 1
         or pc.use_ubatching
@@ -415,7 +416,11 @@ def maybe_create_column_gather(
     tp_group = get_tp_group()
     try:
         workspace = MuseSparkColumnGather(
-            min(MAX_TOKENS, vllm_config.scheduler_config.max_num_batched_tokens),
+            min(
+                MAX_TOKENS,
+                envs.VLLM_ROCM_MUSE_SHARD_PROJECTIONS_MAX_TOKENS,
+                vllm_config.scheduler_config.max_num_batched_tokens,
+            ),
             max_hidden,
             tp_group.cpu_group,
         )
