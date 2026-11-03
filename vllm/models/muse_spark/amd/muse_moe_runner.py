@@ -55,6 +55,9 @@ from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.models.muse_spark.amd.ops.fused_finalize_all_reduce import (
+    get_finalize_all_reduce,
+)
 from vllm.models.muse_spark.amd.ops.fused_norm_expand import take_expanded
 from vllm.models.muse_spark.common.layers import MuseSpark1xRMSNorm
 from vllm.models.muse_spark.common.moe import (
@@ -215,6 +218,22 @@ class MuseSparkTopKWeightAndReduce(mk.TopKWeightAndReduce):
             # Only the fused finalize masks unwritten non-local routes itself.
             routed.masked_fill_((expert_map[topk_ids.long()] < 0).unsqueeze(-1), 0)
             expert_map = None
+
+        if (
+            self.pre_norm_all_reduce
+            and (norm := self.fused_norm) is not None
+            and (fused := get_finalize_all_reduce()) is not None
+            and fused.supports(routed, output)
+        ):
+            return fused(
+                routed,
+                norm.weight if norm.has_weight else None,
+                topk_weights,
+                norm.variance_epsilon,
+                norm.fused_gain_center,
+                norm.applies_weight_before_norm,
+                output,
+            )
 
         chunk_size = self._chunk_size(top_k, hidden_dim)
         for start in range(0, num_tokens, chunk_size):

@@ -75,6 +75,7 @@ from .muse_moe_runner import (
     MuseSparkQuarkOCPMXFusedMoE,
     MuseSparkRoutedExperts,
 )
+from .ops.fused_finalize_all_reduce import maybe_create_finalize_all_reduce
 from .ops.fused_norm_expand import fused_rmsnorm_expand
 from .ops.fused_qk_norm_rope_kv import rocm_fused_qk_norm_rope_kv_insert
 from .ops.router_bf16x3 import (
@@ -246,6 +247,10 @@ class MuseSpark1xMoE(nn.Module):
             self.pre_expert_norm = None
 
         self.intermediate_size = config.moe_intermediate_size
+        if self.tp_size > 1:
+            maybe_create_finalize_all_reduce(
+                vllm_config, config.num_experts_per_tok, hidden_size
+            )
 
         self.post_expert_norm: MuseSpark1xRMSNorm | None = (
             MuseSpark1xRMSNormWithInputScale(

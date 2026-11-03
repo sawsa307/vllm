@@ -142,6 +142,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
     VLLM_ROCM_MUSE_MOE_REDUCE_DTYPE: str = "fp32"
     VLLM_ROCM_MUSE_MOE_ONLINE_QUANT: str = ""
+    VLLM_ROCM_MUSE_FUSED_FINALIZE_ALL_REDUCE: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1325,6 +1326,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_MUSE_MOE_ONLINE_QUANT": lambda: os.getenv(
         "VLLM_ROCM_MUSE_MOE_ONLINE_QUANT", ""
     ).lower(),
+    # Muse Spark on ROCm, pure TP: fuse the pre-norm all-reduce of the GEMM2
+    # route rows with the post-expert finalize for decode-sized batches.
+    "VLLM_ROCM_MUSE_FUSED_FINALIZE_ALL_REDUCE": lambda: (
+        os.getenv("VLLM_ROCM_MUSE_FUSED_FINALIZE_ALL_REDUCE", "1").lower()
+        in ("true", "1")
+    ),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops
     # - scaled_mm (per-tensor / rowwise)
