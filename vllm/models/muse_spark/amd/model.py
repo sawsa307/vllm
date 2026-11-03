@@ -15,6 +15,7 @@ from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
@@ -75,6 +76,7 @@ from .muse_moe_runner import (
     MuseSparkQuarkOCPMXFusedMoE,
     MuseSparkRoutedExperts,
 )
+from .ops.column_gather import maybe_create_column_gather
 from .ops.fused_finalize_all_reduce import maybe_create_finalize_all_reduce
 from .ops.fused_norm_expand import fused_rmsnorm_expand
 from .ops.fused_qk_norm_rope_kv import rocm_fused_qk_norm_rope_kv_insert
@@ -247,9 +249,13 @@ class MuseSpark1xMoE(nn.Module):
             self.pre_expert_norm = None
 
         self.intermediate_size = config.moe_intermediate_size
+        self.column_gather = None
         if self.tp_size > 1:
             maybe_create_finalize_all_reduce(
                 vllm_config, config.num_experts_per_tok, hidden_size
+            )
+            self.column_gather = maybe_create_column_gather(
+                vllm_config, max(config.hidden_size, hidden_size)
             )
 
         self.post_expert_norm: MuseSpark1xRMSNorm | None = (
@@ -337,11 +343,36 @@ class MuseSpark1xMoE(nn.Module):
             )
         )
 
+    def _local_columns(self, layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        """This rank's block of ``layer``'s output columns (full weights)."""
+        rows = layer.weight.shape[0] // self.tp_size
+        start = get_tensor_model_parallel_rank() * rows
+        return F.linear(x, layer.weight[start : start + rows])
+
+    def _gathers(self, layer: nn.Module | None, x: torch.Tensor) -> bool:
+        """Whether ``layer`` runs column-sharded, gathered by the next norm."""
+        return (
+            layer is not None
+            and self.column_gather is not None
+            and self.column_gather.supports(x.shape[0], layer.weight.shape[0], x.dtype)
+        )
+
     def _pool(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.pooler is None:
             return hidden_states
-        hidden_states, _ = self.pooler(hidden_states)
         norm = self.pre_expert_norm
+        if (
+            norm is not None
+            and norm.variance_size_override is None
+            and self._gathers(self.pooler, hidden_states)
+        ):
+            assert self.column_gather is not None
+            return self.column_gather.gather_rmsnorm(
+                self._local_columns(self.pooler, hidden_states),
+                norm,
+                self.top_k if self._experts_take_expanded_input else 1,
+            )
+        hidden_states, _ = self.pooler(hidden_states)
         if norm is None:
             return hidden_states
         if self._experts_take_expanded_input and hidden_states.is_contiguous():
