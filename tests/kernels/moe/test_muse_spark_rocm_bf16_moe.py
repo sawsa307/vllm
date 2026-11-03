@@ -457,7 +457,15 @@ def test_post_expert_norm_precedes_router_weight_and_topk_reduce() -> None:
     assert not torch.allclose(actual.float(), wrong_order)
 
 
-def test_tp_partial_routes_are_reduced_before_norm(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("reduce_dtype", "dtype"), [("fp32", torch.float32), ("bf16", torch.bfloat16)]
+)
+def test_tp_partial_routes_are_reduced_before_norm(
+    monkeypatch, reduce_dtype: str, dtype: torch.dtype
+) -> None:
+    """The route rows are all-reduced in VLLM_ROCM_MUSE_MOE_REDUCE_DTYPE, then
+    normalized (the recipe sets bf16; the default is fp32)."""
+    monkeypatch.setattr(envs, "VLLM_ROCM_MUSE_MOE_REDUCE_DTYPE", reduce_dtype)
     routed = torch.tensor([[[1.0, 2.0], [3.0, 5.0]]], dtype=torch.bfloat16)
     peer = torch.tensor([[[7.0, 11.0], [13.0, 17.0]]], dtype=torch.float32)
     weights = torch.tensor([[0.25, 0.75]])
@@ -467,8 +475,9 @@ def test_tp_partial_routes_are_reduced_before_norm(monkeypatch) -> None:
 
     def _all_reduce(x: torch.Tensor) -> torch.Tensor:
         calls.append(x.clone())
-        assert x.dtype == torch.float32
-        return x + peer
+        assert x.dtype == dtype
+        # An all-reduce returns its input dtype.
+        return (x.float() + peer).to(x.dtype)
 
     monkeypatch.setattr(
         "vllm.models.muse_spark.amd.muse_moe_runner.tensor_model_parallel_all_reduce",
@@ -484,7 +493,7 @@ def test_tp_partial_routes_are_reduced_before_norm(monkeypatch) -> None:
     reducer = MuseSparkTopKWeightAndReduce(_tracked_norm, pre_norm_all_reduce=True)
     actual = reducer.apply(None, routed, weights, ids, False)
 
-    reduced = routed.float() + peer
+    reduced = (routed.float() + peer).to(dtype)
     expected = (
         (_rms_norm(reduced, out_dtype=torch.float32) * weights[..., None].float())
         .sum(dim=1)
@@ -492,7 +501,7 @@ def test_tp_partial_routes_are_reduced_before_norm(monkeypatch) -> None:
     )
     torch.testing.assert_close(actual, expected)
     assert len(calls) == 1
-    assert norm_calls == [(torch.float32, torch.float32)]
+    assert norm_calls == [(dtype, torch.float32)]
 
 
 def test_finalize_is_chunk_invariant() -> None:
