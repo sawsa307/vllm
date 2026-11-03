@@ -219,13 +219,16 @@ class MuseSparkTopKWeightAndReduce(mk.TopKWeightAndReduce):
             routed.masked_fill_((expert_map[topk_ids.long()] < 0).unsqueeze(-1), 0)
             expert_map = None
 
+        fused = get_finalize_all_reduce()
+        if fused is not None:
+            fused.output_reduced = False
         if (
-            self.pre_norm_all_reduce
+            fused is not None
             and (norm := self.fused_norm) is not None
-            and (fused := get_finalize_all_reduce()) is not None
+            and fused.pre_norm == self.pre_norm_all_reduce
             and fused.supports(routed, output)
         ):
-            return fused(
+            fused(
                 routed,
                 norm.weight if norm.has_weight else None,
                 topk_weights,
@@ -233,7 +236,12 @@ class MuseSparkTopKWeightAndReduce(mk.TopKWeightAndReduce):
                 norm.fused_gain_center,
                 norm.applies_weight_before_norm,
                 output,
+                topk_ids=None if expert_map is None else topk_ids,
+                expert_map=expert_map,
             )
+            # Under EP this replaces the MoE runner's final all-reduce.
+            fused.output_reduced = not fused.pre_norm
+            return output
 
         chunk_size = self._chunk_size(top_k, hidden_dim)
         for start in range(0, num_tokens, chunk_size):
@@ -928,7 +936,10 @@ class MuseMoERunner(MoERunner):
 
     @property
     def _fused_output_is_reduced(self) -> bool:
-        return needs_pre_norm_all_reduce(self.moe_config)
+        fused = get_finalize_all_reduce()
+        return needs_pre_norm_all_reduce(self.moe_config) or (
+            fused is not None and fused.output_reduced
+        )
 
 
 __all__ = [

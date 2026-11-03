@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Muse Spark ROCm fused MoE finalize + TP all-reduce against the unfused path."""
+"""Muse Spark ROCm fused MoE finalize + TP all-reduce against the unfused paths."""
 
 import pytest
 import ray
@@ -51,7 +51,7 @@ def _fused_finalize_all_reduce(monkeypatch, tp_size, pp_size, rank, port):
         init_test_distributed_environment(tp_size, pp_size, rank, port)
         ensure_model_parallel_initialized(tp_size, pp_size)
         group = get_tp_group()
-        op = MuseSparkFinalizeAllReduce(255, TOP_K, H, group.cpu_group)
+        op = MuseSparkFinalizeAllReduce(255, TOP_K, H, group.cpu_group, pre_norm=True)
         weight = torch.randn(H, device=device) * 0.1
         weight = weight.bfloat16()
         dist.broadcast(weight, 0, group=group.device_group)
@@ -116,6 +116,92 @@ def _fused_finalize_all_reduce(monkeypatch, tp_size, pp_size, rank, port):
             torch.accelerator.synchronize()
             check(static_out, partials, tw, weight, True)
         op.close()
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def _fused_finalize_all_reduce_ep(monkeypatch, tp_size, pp_size, rank, port):
+    """TP + EP: each rank holds only its experts' routes; the rest are NaN."""
+    from vllm.distributed import get_tp_group
+    from vllm.models.muse_spark.amd.ops.fused_finalize_all_reduce import (
+        MuseSparkFinalizeAllReduce,
+    )
+    from vllm.models.muse_spark.common.ops.fused_finalize import (
+        fused_post_expert_finalize,
+    )
+
+    num_experts = 64
+    per_rank = num_experts // tp_size
+    with monkeypatch.context() as m:
+        m.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        device = torch.device(f"cuda:{rank}")
+        torch.accelerator.set_device_index(device)
+        init_test_distributed_environment(tp_size, pp_size, rank, port)
+        ensure_model_parallel_initialized(tp_size, pp_size)
+        group = get_tp_group()
+        op = MuseSparkFinalizeAllReduce(255, TOP_K, H, group.cpu_group, pre_norm=False)
+        weight = (torch.ones(H, device=device) * 0.1).bfloat16()
+        expert_map = torch.full((num_experts,), -1, dtype=torch.int32, device=device)
+        expert_map[rank * per_rank : (rank + 1) * per_rank] = torch.arange(
+            per_rank, dtype=torch.int32, device=device
+        )
+
+        for step, n in enumerate((1, 3, 128, 7, 255, 64, 2, 255, 16)):
+            gen = torch.Generator(device=device).manual_seed(500 + step)
+            full = torch.randn(n, TOP_K, H, device=device, generator=gen).bfloat16()
+            tw = torch.rand(n, TOP_K, device=device, generator=gen)
+            ids = torch.stack(
+                [
+                    torch.randperm(num_experts, device=device, generator=gen)[:TOP_K]
+                    for _ in range(n)
+                ]
+            ).int()
+            local = (ids // per_rank == rank)[..., None]
+            for use_map in (True, False):
+                # Without a map, non-local rows are zero (AITER's convention).
+                fill = float("nan") if use_map else 0.0
+                rows = torch.where(local, full, torch.full_like(full, fill))
+                out = torch.empty(n, H, dtype=torch.bfloat16, device=device)
+                op(
+                    rows,
+                    weight,
+                    tw,
+                    EPS,
+                    1.0,
+                    True,
+                    out,
+                    topk_ids=ids if use_map else None,
+                    expert_map=expert_map if use_map else None,
+                )
+                ref = _reference([full], weight, tw, True)
+                torch.testing.assert_close(out.float(), ref, atol=1.5e-2, rtol=1e-2)
+                # The unfused production path: local finalize, then all-reduce.
+                unfused = torch.empty_like(out)
+                fused_post_expert_finalize(
+                    rows,
+                    weight,
+                    tw,
+                    EPS,
+                    1.0,
+                    True,
+                    unfused,
+                    topk_ids=ids if use_map else None,
+                    expert_map=expert_map if use_map else None,
+                )
+                dist.all_reduce(unfused, group=group.device_group)
+                torch.testing.assert_close(out, unfused, atol=1.5e-2, rtol=1e-2)
+                gathered = [torch.empty_like(out) for _ in range(tp_size)]
+                dist.all_gather(gathered, out, group=group.device_group)
+                for other in gathered:
+                    assert torch.equal(other, out)
+        op.close()
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-only kernel")
+@pytest.mark.parametrize("tp_size", [2, 4, 8])
+def test_fused_finalize_all_reduce_ep_matches_unfused(monkeypatch, tp_size):
+    if torch.accelerator.device_count() < tp_size:
+        pytest.skip(f"Requires {tp_size} GPUs")
+    multi_process_parallel(monkeypatch, tp_size, 1, _fused_finalize_all_reduce_ep)
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-only kernel")

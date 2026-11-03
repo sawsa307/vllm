@@ -1326,8 +1326,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_MUSE_MOE_ONLINE_QUANT": lambda: os.getenv(
         "VLLM_ROCM_MUSE_MOE_ONLINE_QUANT", ""
     ).lower(),
-    # Muse Spark on ROCm, pure TP: fuse the pre-norm all-reduce of the GEMM2
-    # route rows with the post-expert finalize for decode-sized batches.
+    # Muse Spark on ROCm, TP or TP + EP: fuse the MoE post-expert finalize with
+    # its TP all-reduce for decode-sized batches.
     "VLLM_ROCM_MUSE_FUSED_FINALIZE_ALL_REDUCE": lambda: (
         os.getenv("VLLM_ROCM_MUSE_FUSED_FINALIZE_ALL_REDUCE", "1").lower()
         in ("true", "1")

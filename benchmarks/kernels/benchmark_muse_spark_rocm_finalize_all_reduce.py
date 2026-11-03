@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Muse Spark ROCm MoE finalize: unfused TP all-reduce + finalize vs. fused.
+"""Muse Spark ROCm MoE finalize: unfused finalize + TP all-reduce vs. fused.
 
-The unfused arm is the production path of ``MuseSparkTopKWeightAndReduce``
-below 256 tokens: ``tensor_model_parallel_all_reduce`` of the ``[T, top_k, H]``
-route rows in the reduce dtype (AITER / custom all-reduce as configured), then
-``fused_post_expert_finalize``. Both arms are timed as graph replays of
-``--calls`` back-to-back calls.
+The unfused arm is the production path below 256 tokens:
+
+* pure TP: ``tensor_model_parallel_all_reduce`` of the ``[T, top_k, H]`` route
+  rows in the reduce dtype, then ``fused_post_expert_finalize``;
+* ``--ep`` (TP + EP over the same group): ``fused_post_expert_finalize`` of the
+  local routes (``1 / TP`` of them), then the MoE runner's all-reduce of the
+  ``[T, H]`` output.
+
+Both arms are timed as graph replays of ``--calls`` back-to-back calls.
 
 Usage:
-    VLLM_ROCM_USE_AITER=1 torchrun --nproc_per_node=4 \
-        benchmarks/kernels/benchmark_muse_spark_rocm_finalize_all_reduce.py
+    VLLM_ROCM_USE_AITER=1 torchrun --nproc_per_node=8 \
+        benchmarks/kernels/benchmark_muse_spark_rocm_finalize_all_reduce.py [--ep]
 """
 
 import os
@@ -70,6 +74,8 @@ def main() -> None:
     parser.add_argument("--hidden-size", type=int, default=4096)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--reduce-dtype", choices=["bf16", "fp32"], default="bf16")
+    parser.add_argument("--ep", action="store_true", help="TP + EP finalize")
+    parser.add_argument("--num-experts", type=int, default=256)
     parser.add_argument("--calls", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
     args = parser.parse_args()
@@ -86,24 +92,64 @@ def main() -> None:
     tp = get_tp_group()
     reduce_dtype = torch.bfloat16 if args.reduce_dtype == "bf16" else torch.float32
     H, K = args.hidden_size, args.top_k
-    fused = MuseSparkFinalizeAllReduce(max(args.tokens), K, H, tp.cpu_group)
+    fused = MuseSparkFinalizeAllReduce(
+        max(args.tokens), K, H, tp.cpu_group, pre_norm=not args.ep
+    )
     weight = torch.randn(H, device=device).bfloat16()
+    per_rank = args.num_experts // world_size
+    rank = tp.rank_in_group
+    expert_map = torch.full((args.num_experts,), -1, dtype=torch.int32, device=device)
+    expert_map[rank * per_rank : (rank + 1) * per_rank] = torch.arange(
+        per_rank, dtype=torch.int32, device=device
+    )
 
     if tp.rank_in_group == 0:
-        print(f"TP{world_size} H={H} top_k={K} reduce={args.reduce_dtype}")
+        mode = "EP" if args.ep else f"reduce={args.reduce_dtype}"
+        print(f"TP{world_size} H={H} top_k={K} {mode}")
         print(f"{'tokens':>7} {'unfused us':>11} {'fused us':>9} {'speedup':>8}")
     for n in args.tokens:
         rows = torch.randn(n, K, H, device=device).bfloat16()
         tw = torch.rand(n, K, device=device)
         out_ref = torch.empty(n, H, dtype=torch.bfloat16, device=device)
         out = torch.empty_like(out_ref)
+        gen = torch.Generator(device=device).manual_seed(n)
+        ids = torch.stack(
+            [
+                torch.randperm(args.num_experts, device=device, generator=gen)[:K]
+                for _ in range(n)
+            ]
+        ).int()
 
-        def unfused(rows=rows, tw=tw, out_ref=out_ref):
+        def unfused(rows=rows, tw=tw, ids=ids, out_ref=out_ref):
+            if args.ep:
+                fused_post_expert_finalize(
+                    rows,
+                    weight,
+                    tw,
+                    EPS,
+                    1.0,
+                    True,
+                    out_ref,
+                    topk_ids=ids,
+                    expert_map=expert_map,
+                )
+                out_ref.copy_(tensor_model_parallel_all_reduce(out_ref))
+                return
             reduced = tensor_model_parallel_all_reduce(rows.to(reduce_dtype))
             fused_post_expert_finalize(reduced, weight, tw, EPS, 1.0, True, out_ref)
 
-        def fused_call(rows=rows, tw=tw, out=out):
-            fused(rows, weight, tw, EPS, 1.0, True, out)
+        def fused_call(rows=rows, tw=tw, ids=ids, out=out):
+            fused(
+                rows,
+                weight,
+                tw,
+                EPS,
+                1.0,
+                True,
+                out,
+                topk_ids=ids if args.ep else None,
+                expert_map=expert_map if args.ep else None,
+            )
 
         unfused_us = _time_graph(unfused, args.calls, args.iters)
         fused_us = _time_graph(fused_call, args.calls, args.iters)
