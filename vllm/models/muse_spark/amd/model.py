@@ -90,6 +90,7 @@ from .ops.router_bf16x3 import (
     split_fp32_to_bf16x3,
     supports_router_bf16x3,
 )
+from .ops.skinny_gemm import skinny_gemm, skinny_gemm_config
 
 logger = init_logger(__name__)
 
@@ -97,7 +98,7 @@ logger = init_logger(__name__)
 _ROUTER_BF16X3_MIN_TOKENS = 16
 
 
-def _supports_router_bf16x3_device() -> bool:
+def _on_gfx950() -> bool:
     if not current_platform.is_rocm():
         return False
 
@@ -105,6 +106,10 @@ def _supports_router_bf16x3_device() -> bool:
     from vllm.platforms.rocm import on_gfx950
 
     return on_gfx950()
+
+
+def _supports_router_bf16x3_device() -> bool:
+    return _on_gfx950()
 
 
 @dataclass(slots=True)
@@ -295,6 +300,8 @@ class MuseSpark1xMoE(nn.Module):
 
         self.intermediate_size = config.moe_intermediate_size
         self.fp32_router_input = envs.VLLM_ROCM_MUSE_FP32_ROUTER_INPUT
+        # The split-K configs are tuned on gfx950 only.
+        self.skinny_gemm = _on_gfx950()
         self.column_gather = None
         if self.tp_size > 1:
             maybe_create_finalize_all_reduce(
@@ -402,10 +409,22 @@ class MuseSpark1xMoE(nn.Module):
         )
 
     def _local_columns(self, layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
-        """This rank's block of ``layer``'s output columns (full weights)."""
+        """This rank's block of ``layer``'s output columns (full weights).
+
+        The block is too narrow for hipBLASLt to fill the GPU at decode sizes;
+        shapes with a tuned config take the fp32-accumulating split-K GEMM.
+        """
         rows = layer.weight.shape[0] // self.tp_size
         start = get_tensor_model_parallel_rank() * rows
-        return F.linear(x, layer.weight[start : start + rows])
+        weight = layer.weight[start : start + rows]
+        if (
+            self.skinny_gemm
+            and x.dim() == 2
+            and x.stride(1) == 1
+            and (config := skinny_gemm_config(rows, x.shape[1], x.shape[0]))
+        ):
+            return skinny_gemm(x, weight, config)
+        return F.linear(x, weight)
 
     def _gathers(self, layer: nn.Module | None, x: torch.Tensor) -> bool:
         """Whether ``layer`` runs column-sharded, gathered by the next norm."""
