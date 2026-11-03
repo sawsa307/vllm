@@ -115,7 +115,8 @@ def _token_sharded_parallelism(vllm_config: VllmConfig) -> bool:
     parallel_config = vllm_config.parallel_config
     tp_size = get_tensor_model_parallel_world_size()
     return (
-        parallel_config.enable_expert_parallel
+        envs.VLLM_ROCM_MUSE_TOKEN_SHARDED
+        and parallel_config.enable_expert_parallel
         and tp_size > 1
         and get_ep_group().device_group.size() == tp_size
         and parallel_config.data_parallel_size == 1
