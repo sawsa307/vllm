@@ -939,10 +939,13 @@ class MuseSparkMono:
         bucket = self.buckets[rows]
         bucket.epoch.add_(1)
 
+        # model.py imports this package
+        from ..model import materialize, norm_residual_then_norm
+
         y = layers[0](positions, x)
         if 1 in aux_layers:
+            y = materialize(y)
             aux_hidden_states.append(norm_then_gated_residual(y))
-        from ..model import norm_residual_then_norm  # model.py imports this package
 
         attn = layers[FIRST_LAYER].self_attn
         attn_input, stream = norm_residual_then_norm(
@@ -960,6 +963,7 @@ class MuseSparkMono:
         o = last.self_attn.attn(q, None, None)
         y = last.after_attention(stream, last.self_attn.back(o, g))
         if LAST_LAYER + 2 in aux_layers:
+            y = materialize(y)
             aux_hidden_states.append(norm_then_gated_residual(y))
         return y
 

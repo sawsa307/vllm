@@ -16,6 +16,7 @@ from ..utils import (
 )
 
 POOLED = 4096
+HIDDEN = 8192
 TOP_K = 8
 
 
@@ -107,6 +108,134 @@ def _gather_rmsnorm(monkeypatch, tp_size, pp_size, rank, port):
             for out in outs:
                 assert torch.equal(out, ref)
         gather.close()
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def _gather_boundary(monkeypatch, tp_size, pp_size, rank, port):
+    """Unpooler column blocks gathered into the FFN residual boundary."""
+    from vllm.distributed import get_tp_group
+    from vllm.models.muse_spark.amd.ops.column_gather import MuseSparkColumnGather
+    from vllm.models.muse_spark.common.layers import (
+        MuseSpark1xNormPreservingResidualConnection,
+        MuseSpark1xRMSNorm,
+        MuseSpark1xRMSNormWithInputScale,
+    )
+    from vllm.models.muse_spark.common.ops.fused_rmsnorm import (
+        fused_norm_residual_norm_fwd,
+    )
+
+    with monkeypatch.context() as m:
+        m.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        device = torch.device(f"cuda:{rank}")
+        torch.accelerator.set_device_index(device)
+        init_test_distributed_environment(tp_size, pp_size, rank, port)
+        ensure_model_parallel_initialized(tp_size, pp_size)
+        group = get_tp_group()
+        gather = MuseSparkColumnGather(256, HIDDEN, group.cpu_group)
+        # The target decoder's post-FFN norm, gate and next pre-QKV norm.
+        post = MuseSpark1xRMSNormWithInputScale(
+            HIDDEN,
+            eps=1e-5,
+            has_weight=True,
+            is_post_norm=True,
+            zero_centered_gamma=True,
+            post_norm_gain_center_type="one",
+            residual_id=4,
+            output_norm_gain_center_type="zero",
+        ).to(device)
+        pre = MuseSpark1xRMSNorm(
+            HIDDEN,
+            eps=1e-5,
+            has_weight=True,
+            is_post_norm=False,
+            zero_centered_gamma=True,
+            post_norm_gain_center_type="one",
+            residual_id=5,
+        ).to(device)
+        connection = MuseSpark1xNormPreservingResidualConnection(HIDDEN).to(device)
+        with torch.no_grad():
+            post.weight.copy_(torch.linspace(-0.3, 0.3, HIDDEN))
+            pre.weight.copy_(torch.linspace(0.2, -0.2, HIDDEN))
+            connection.gate.copy_(torch.linspace(-2.0, 2.0, HIDDEN))
+        connection.materialize_coefficients()
+        block = HIDDEN // tp_size
+
+        def unfused(branch, stream):
+            return fused_norm_residual_norm_fwd(
+                branch,
+                stream,
+                post.weight,
+                pre.weight,
+                post.variance_epsilon,
+                pre.variance_epsilon,
+                alpha=connection.alpha,
+                beta=connection.beta,
+                post_gain_center=post.fused_gain_center,
+                pre_gain_center=pre.fused_gain_center,
+                post_input_scale=True,
+                pre_input_scale=False,
+                out_dtype=torch.bfloat16,
+            )
+
+        def check(n, seed):
+            gen = torch.Generator(device=device).manual_seed(seed)
+            branch = torch.randn(n, HIDDEN, device=device, generator=gen).bfloat16()
+            stream = torch.randn(n, HIDDEN, device=device, generator=gen)
+            shard = branch[:, rank * block : (rank + 1) * block]
+            assert gather.supports_boundary(shard, stream, post, connection, pre)
+            out, new_stream = gather.gather_boundary(
+                shard, stream, post, connection, pre, torch.bfloat16
+            )
+            ref_out, ref_stream = unfused(branch, stream)
+            # The boundary math is shared with the unfused kernel.
+            assert torch.equal(out, ref_out)
+            assert torch.equal(new_stream, ref_stream)
+
+        # Alternate with pooler gathers: both share the parity buffers.
+        pooled_block = POOLED // tp_size
+        norm = MuseSpark1xRMSNorm(POOLED, eps=1e-6, has_weight=False).to(device)
+        for step, n in enumerate((1, 3, 256, 7, 64, 2, 255, 16, 129)):
+            check(n, 200 + step)
+            pooled = torch.randn(n, POOLED, device=device).bfloat16()
+            start = rank * pooled_block
+            gather.gather_rmsnorm(pooled[:, start : start + pooled_block], norm, 1)
+
+        # Graph replay.
+        n = 32
+        static_branch = torch.zeros(n, HIDDEN, dtype=torch.bfloat16, device=device)
+        static_stream = torch.zeros(n, HIDDEN, device=device)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outs = [
+                gather.gather_boundary(
+                    static_branch[:, rank * block : (rank + 1) * block],
+                    static_stream,
+                    post,
+                    connection,
+                    pre,
+                    torch.bfloat16,
+                )
+                for _ in range(3)
+            ]
+        for seed in range(10):
+            gen = torch.Generator(device=device).manual_seed(2000 + seed)
+            static_branch.copy_(torch.randn(n, HIDDEN, device=device, generator=gen))
+            static_stream.copy_(torch.randn(n, HIDDEN, device=device, generator=gen))
+            graph.replay()
+            torch.accelerator.synchronize()
+            ref_out, ref_stream = unfused(static_branch, static_stream)
+            for out, new_stream in outs:
+                assert torch.equal(out, ref_out)
+                assert torch.equal(new_stream, ref_stream)
+        gather.close()
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-only kernel")
+@pytest.mark.parametrize("tp_size", [2, 4, 8])
+def test_gather_boundary_matches_unfused(monkeypatch, tp_size):
+    if torch.accelerator.device_count() < tp_size:
+        pytest.skip(f"Requires {tp_size} GPUs")
+    multi_process_parallel(monkeypatch, tp_size, 1, _gather_boundary)
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-only kernel")
