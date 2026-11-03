@@ -13,10 +13,12 @@ first entry whose max-token bound covers the batch, so a shape gets entries
 only up to the last token count of a contiguous run where the skinny GEMM wins.
 
 Usage (one GPU):
-    python benchmarks/kernels/tune_muse_spark_rocm_skinny_gemm.py --tp-sizes 4
+    python benchmarks/kernels/tune_muse_spark_rocm_skinny_gemm.py --tp-sizes 4 \\
+        [--allowlist spill_free.json] [--min-grid 256]
 """
 
 import itertools
+import json
 
 import torch
 import torch.nn.functional as F
@@ -55,18 +57,26 @@ def _accurate(out: torch.Tensor, x: torch.Tensor, w: torch.Tensor) -> bool:
     return bool(((out.double() - ref).abs() <= bound).all())
 
 
-def _candidates(n: int, k: int, m: int):
-    max_block_m = max(8, 1 << (m - 1).bit_length())
-    for block_m, block_n, block_k, splits, warps in itertools.product(
+def _candidates(n: int, k: int, m: int, min_grid: int, allowed: set | None):
+    """Configs to time. ``min_grid`` drops grids with fewer workgroups (every
+    tuned TP8 entry launches at least 256, one per MI355X CU); ``allowed``, if
+    given, keeps only those configs (e.g. the spill-free ones of an AOT pass)."""
+    max_block_m = max(16, 1 << (m - 1).bit_length())
+    for cfg in itertools.product(
         (8, 16, 32, 64, 128),
         (16, 32, 64, 128),
-        (16, 32, 64, 128),
-        (1, 2, 4, 8, 16),
+        (16, 32, 64, 128, 256, 512),
+        (1, 2, 4, 8, 16, 32),
         (2, 4, 8),
     ):
+        block_m, block_n, block_k, splits, _ = cfg
         if block_m > max_block_m or n % block_n or k % (splits * block_k):
             continue
-        yield (block_m, block_n, block_k, splits, warps)
+        if (n // block_n) * splits * -(-m // block_m) < min_grid:
+            continue
+        if allowed is not None and cfg not in allowed:
+            continue
+        yield cfg
 
 
 def main() -> None:
@@ -77,7 +87,25 @@ def main() -> None:
     )
     parser.add_argument("--copies", type=int, default=16)
     parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument(
+        "--min-grid",
+        type=int,
+        default=256,
+        help="skip configs launching fewer workgroups (0: keep all)",
+    )
+    parser.add_argument(
+        "--allowlist",
+        help='JSON {"N,K": [[block_m, block_n, block_k, splits, warps], ...]}: '
+        "time only these configs per shape",
+    )
     args = parser.parse_args()
+    allowlist = None
+    if args.allowlist:
+        with open(args.allowlist) as f:
+            allowlist = {
+                tuple(map(int, shape.split(","))): {tuple(c) for c in cfgs}
+                for shape, cfgs in json.load(f).items()
+            }
 
     torch.manual_seed(0)
     table: dict[tuple[int, int], list[tuple[int, tuple[int, ...]]]] = {}
@@ -101,7 +129,8 @@ def main() -> None:
                     args.iters,
                 )
                 best = None
-                for cfg in _candidates(n, k, m):
+                allowed = None if allowlist is None else allowlist.get((n, k), set())
+                for cfg in _candidates(n, k, m, args.min_grid, allowed):
                     try:
                         if not _accurate(
                             skinny_gemm(x, weights[0], cfg), x, weights[0]
