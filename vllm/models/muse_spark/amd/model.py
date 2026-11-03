@@ -20,6 +20,8 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_reduce_scatter,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -74,6 +76,7 @@ from vllm.transformers_utils.configs.muse_spark import (
 
 from .mono import MuseSparkMono, maybe_attach_mono
 from .muse_moe_runner import (
+    _TOKEN_SHARDED_MIN_TOKENS,
     MuseMoERunner,
     MuseSparkQuarkOCPMXFusedMoE,
     MuseSparkRoutedExperts,
@@ -82,7 +85,10 @@ from .muse_moe_runner import (
 )
 from .ops.all_reduce_boundary import maybe_create_all_reduce_boundary
 from .ops.column_gather import MuseSparkColumnGather, maybe_create_column_gather
-from .ops.fused_finalize_all_reduce import maybe_create_finalize_all_reduce
+from .ops.fused_finalize_all_reduce import (
+    get_finalize_all_reduce,
+    maybe_create_finalize_all_reduce,
+)
 from .ops.fused_norm_expand import fused_rmsnorm_expand
 from .ops.fused_qk_norm_rope_kv import rocm_fused_qk_norm_rope_kv_insert
 from .ops.router_bf16x3 import (
@@ -96,6 +102,33 @@ logger = init_logger(__name__)
 
 # Below this the fp32 Triton router GEMM is at least as fast in serving.
 _ROUTER_BF16X3_MIN_TOKENS = 16
+
+
+def _token_sharded_parallelism(vllm_config: VllmConfig) -> bool:
+    """EP spans the whole TP group with DP1, so ranks can split tokens instead.
+
+    Batches of ``_TOKEN_SHARDED_MIN_TOKENS`` or more then keep the residual
+    stream split over tokens (all-gather before attention, reduce-scatter after
+    it and around the experts), as the CUDA path does above its threshold;
+    smaller batches keep the replicated stream and the fused decode collectives.
+    """
+    parallel_config = vllm_config.parallel_config
+    tp_size = get_tensor_model_parallel_world_size()
+    return (
+        parallel_config.enable_expert_parallel
+        and tp_size > 1
+        and get_ep_group().device_group.size() == tp_size
+        and parallel_config.data_parallel_size == 1
+        and not parallel_config.use_sequence_parallel_moe
+    )
+
+
+def _reduce_scatter_tokens(x: torch.Tensor) -> torch.Tensor:
+    """Reduce-scatter over tokens, padding them to a multiple of the TP size."""
+    pad = -x.shape[0] % get_tensor_model_parallel_world_size()
+    if pad:
+        x = F.pad(x, (0, 0, 0, pad))
+    return tensor_model_parallel_reduce_scatter(x, 0)
 
 
 def _on_gfx950() -> bool:
@@ -226,6 +259,10 @@ class MuseSpark1xMoE(nn.Module):
         )
 
         self.ep_size = get_ep_group().device_group.size()
+        # The block reduces the expert output itself: reduce-scatter for
+        # token-sharded batches, all-reduce otherwise (unless the fused finalize
+        # already did).
+        self.shard_tokens = _token_sharded_parallelism(vllm_config)
         self.n_routed_experts = config.num_local_experts
         self.n_logical_experts = config.num_local_experts
         self.n_redundant_experts = 0
@@ -333,6 +370,7 @@ class MuseSpark1xMoE(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
             is_sequence_parallel=self.is_sequence_parallel,
+            reduce_results=not self.shard_tokens,
             router_logits_dtype=self.router_dtype,
             scoring_func="sigmoid",
             e_score_correction_bias=self.expert_bias,
@@ -436,9 +474,14 @@ class MuseSpark1xMoE(nn.Module):
 
     def defers_unpooler(self, hidden_states: torch.Tensor) -> bool:
         """Whether the unpooler's column gather can be left to the boundary."""
-        return not self.is_sequence_parallel and self._gathers(
-            self.unpooler, hidden_states
+        return (
+            not self.is_sequence_parallel
+            and not self._shards_tokens(hidden_states.shape[0])
+            and self._gathers(self.unpooler, hidden_states)
         )
+
+    def _shards_tokens(self, num_tokens: int) -> bool:
+        return self.shard_tokens and num_tokens >= _TOKEN_SHARDED_MIN_TOKENS
 
     @functools.cached_property
     def _experts_route_per_slot(self) -> bool:
@@ -448,30 +491,18 @@ class MuseSpark1xMoE(nn.Module):
     def _experts_use_ep(self) -> bool:
         return self.experts.routed_experts.moe_config.moe_parallel_config.use_ep
 
-    def _pool(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.pooler is None:
-            return hidden_states
-        norm = self.pre_expert_norm
-        # AITER MXFP4 experts take one input row per route, unless they return
-        # their per-route rows directly (per-slot routes).
-        expand = self._experts_take_expanded_input and not (
+    def _expands(self, num_tokens: int) -> bool:
+        """AITER MXFP4 experts take one input row per route, unless they return
+        their per-route rows directly (per-slot routes)."""
+        return self._experts_take_expanded_input and not (
             self._experts_route_per_slot
-            and per_slot_routes_for_batch(
-                hidden_states.shape[0], self.top_k, self._experts_use_ep
-            )
+            and per_slot_routes_for_batch(num_tokens, self.top_k, self._experts_use_ep)
         )
-        if (
-            norm is not None
-            and norm.variance_size_override is None
-            and self._gathers(self.pooler, hidden_states)
-        ):
-            assert self.column_gather is not None
-            return self.column_gather.gather_rmsnorm(
-                self._local_columns(self.pooler, hidden_states),
-                norm,
-                self.top_k if expand else 1,
-            )
-        hidden_states, _ = self.pooler(hidden_states)
+
+    def _pre_expert_norm(
+        self, hidden_states: torch.Tensor, expand: bool
+    ) -> torch.Tensor:
+        norm = self.pre_expert_norm
         if norm is None:
             return hidden_states
         if self._experts_take_expanded_input and hidden_states.is_contiguous():
@@ -485,6 +516,59 @@ class MuseSpark1xMoE(nn.Module):
             )
         return norm(hidden_states)
 
+    def _pool(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.pooler is None:
+            return hidden_states
+        norm = self.pre_expert_norm
+        expand = self._expands(hidden_states.shape[0])
+        if (
+            norm is not None
+            and norm.variance_size_override is None
+            and self._gathers(self.pooler, hidden_states)
+        ):
+            assert self.column_gather is not None
+            return self.column_gather.gather_rmsnorm(
+                self._local_columns(self.pooler, hidden_states),
+                norm,
+                self.top_k if expand else 1,
+            )
+        hidden_states, _ = self.pooler(hidden_states)
+        return self._pre_expert_norm(hidden_states, expand)
+
+    def _unpool(self, experts_out: torch.Tensor) -> torch.Tensor:
+        if self.unpooler is None:
+            return experts_out
+        experts_out, _ = self.unpooler(experts_out)
+        return experts_out
+
+    def forward_local_tokens(self, local: torch.Tensor) -> torch.Tensor:
+        """MoE over this rank's token slice; returns the same slice.
+
+        The router, pooler, pre-expert norm and unpooler run on the slice; the
+        router logits and pooled rows are all-gathered for the experts, whose
+        output is reduce-scattered back to the slice.
+        """
+        logits = self._router_logits(local)
+        router_logits = tensor_model_parallel_all_gather(logits, 0)
+        pooled = local if self.pooler is None else self.pooler(local)[0]
+        expand = self._expands(router_logits.shape[0])
+        if expand:
+            # The expanded layout is per route, so expand after the gather.
+            pooled = tensor_model_parallel_all_gather(pooled, 0)
+            pooled = self._pre_expert_norm(pooled, expand)
+        else:
+            pooled = self._pre_expert_norm(pooled, expand)
+            pooled = tensor_model_parallel_all_gather(pooled.contiguous(), 0)
+        experts_out = self.experts(hidden_states=pooled, router_logits=router_logits)
+        experts_out = tensor_model_parallel_reduce_scatter(experts_out, 0)
+        return self._unpool(experts_out)
+
+    @staticmethod
+    def _finalize_reduced() -> bool:
+        """Whether the last fused finalize already all-reduced its output."""
+        fused = get_finalize_all_reduce()
+        return fused is not None and fused.output_reduced
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -495,6 +579,10 @@ class MuseSpark1xMoE(nn.Module):
         columns (see :meth:`defers_unpooler`). ``router_input``, if given, is
         the FP32 router input (see :meth:`wants_fp32_router_input`)."""
         num_tokens = hidden_states.shape[0]
+        if self._shards_tokens(num_tokens):
+            assert not defer_column_gather
+            local = self.forward_local_tokens(sequence_parallel_chunk(hidden_states))
+            return tensor_model_parallel_all_gather(local, 0)[:num_tokens]
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
@@ -505,6 +593,8 @@ class MuseSpark1xMoE(nn.Module):
             hidden_states=hidden_states,
             router_logits=router_logits,
         )
+        if self.shard_tokens and not self._finalize_reduced():
+            experts_out = tensor_model_parallel_all_reduce(experts_out)
 
         if defer_column_gather:
             assert self.unpooler is not None
@@ -915,6 +1005,13 @@ class MuseSpark1xDecoderLayer(nn.Module):
             if is_draft
             else config.mlp_layer_types[self.layer_idx] == "sparse"
         )
+        # Batches of _TOKEN_SHARDED_MIN_TOKENS+ can keep the residual stream
+        # split over tokens between layers (see _token_sharded_parallelism).
+        self.token_sharded = (
+            not is_draft
+            and self.is_moe_layer
+            and _token_sharded_parallelism(vllm_config)
+        )
         self.pre_ffn_norm = MuseSpark1xRMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
@@ -999,8 +1096,14 @@ class MuseSpark1xDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         x: MuseSpark1xResidualStream | torch.Tensor,
+        token_sharded: bool = False,
     ) -> MuseSpark1xResidualStream:
-        """Run attention and FFN; the FFN boundary is returned unblended."""
+        """Run attention and FFN; the FFN boundary is returned unblended.
+
+        With ``token_sharded`` the residual stream holds this rank's token slice:
+        the attention input is all-gathered, ``o_proj`` reduce-scattered, and the
+        boundary and MoE block run on the slice.
+        """
         if isinstance(x, torch.Tensor):
             stream = x
             attn_input = self.self_attn.pre_qkv_proj_norm(
@@ -1012,11 +1115,45 @@ class MuseSpark1xDecoderLayer(nn.Module):
             )
         assert stream.dtype == self.residual_dtype
 
+        if token_sharded:
+            assert self.token_sharded
+            attn_input = tensor_model_parallel_all_gather(attn_input, 0)
+            # The partial o_proj sum, reduce-scattered back to this rank's slice.
+            attn_out = self.self_attn(
+                positions=positions,
+                hidden_states=attn_input[: positions.shape[0]],
+                reduce_output=False,
+            )
+            return self._token_sharded_ffn(stream, _reduce_scatter_tokens(attn_out))
+
         reduce = not self._fuses_attn_reduction(stream)
         attn_out = self.self_attn(
             positions=positions, hidden_states=attn_input, reduce_output=reduce
         )
         return self.after_attention(stream, attn_out, reduced=reduce)
+
+    def _token_sharded_ffn(
+        self, stream: torch.Tensor, attn_out: torch.Tensor
+    ) -> MuseSpark1xResidualStream:
+        """The attention boundary and MoE block on this rank's token slice."""
+        ffn_in, stream = norm_residual_then_norm(
+            MuseSpark1xResidualStream(
+                stream=stream,
+                branch=attn_out,
+                post_norm=self.post_attn_norm,
+                connection=self.add_attn,
+            ),
+            self.pre_ffn_norm,
+            out_dtype=self.default_dtype,
+        )
+        moe = self.feed_forward
+        assert isinstance(moe, MuseSpark1xMoE)
+        return MuseSpark1xResidualStream(
+            stream=stream,
+            branch=moe.forward_local_tokens(ffn_in),
+            post_norm=self.post_ffn_norm,
+            connection=self.add_ffn,
+        )
 
     def _fuses_attn_reduction(self, stream: torch.Tensor) -> bool:
         """Whether the attention boundary kernel reduces ``o_proj`` itself."""
@@ -1146,6 +1283,9 @@ class MuseSpark1xModel(LlamaModel):
         self.residual_dtype = torch.float32
 
         self.fuse_across_layers = get_pp_group().world_size == 1
+        self.token_sharded = self.fuse_across_layers and all(
+            getattr(layer, "token_sharded", False) for layer in self.layers
+        )
         self.make_empty_intermediate_tensors = self._make_empty_intermediate_tensors
         # Set after weight loading under --monokernel.
         self.mono: MuseSparkMono | None = None
@@ -1183,6 +1323,7 @@ class MuseSpark1xModel(LlamaModel):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
+        num_tokens = hidden_states.shape[0]
         x: MuseSpark1xResidualStream | torch.Tensor = hidden_states.to(
             self.residual_dtype
         )
@@ -1190,14 +1331,21 @@ class MuseSpark1xModel(LlamaModel):
         aux_hidden_states: list[torch.Tensor] = []
         if get_pp_group().is_first_rank:
             self._maybe_add_hidden_state(aux_hidden_states, self.start_layer, x, None)
+        token_sharded = self.token_sharded and num_tokens >= _TOKEN_SHARDED_MIN_TOKENS
         mono_out = None
-        if self.mono is not None:
+        if self.mono is not None and not token_sharded:
             mono_out = self.mono.try_forward(self, positions, x, aux_hidden_states)
+        if token_sharded:
+            x = sequence_parallel_chunk(x)
         for idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer] if mono_out is None else [],
             start=self.start_layer,
         ):
-            x = layer(positions, x)
+            x = (
+                layer(positions, x, token_sharded)
+                if token_sharded
+                else layer(positions, x)
+            )
             if not self.fuse_across_layers and isinstance(x, MuseSpark1xResidualStream):
                 x = norm_then_gated_residual(materialize(x))
             if idx + 1 in self.aux_hidden_state_layers:
@@ -1208,6 +1356,9 @@ class MuseSpark1xModel(LlamaModel):
                     if isinstance(x, MuseSpark1xResidualStream)
                     else x
                 )
+                if token_sharded:
+                    state = tensor_model_parallel_all_gather(state.contiguous(), 0)
+                    state = state[:num_tokens]
                 aux_hidden_states.append(state)
         if mono_out is not None:
             x = mono_out
@@ -1227,6 +1378,8 @@ class MuseSpark1xModel(LlamaModel):
             output, _ = norm_residual_then_norm(
                 x, self.norm, out_dtype=self.default_dtype
             )
+        if token_sharded:
+            output = tensor_model_parallel_all_gather(output, 0)[:num_tokens]
         aux_hidden_states = remote_aux + aux_hidden_states
         if aux_hidden_states:
             return output, aux_hidden_states
