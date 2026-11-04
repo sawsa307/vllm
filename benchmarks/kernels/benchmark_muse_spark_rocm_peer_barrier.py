@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Cost of one cross-rank grid barrier of the Muse Spark ROCm peer kernels.
+
+The fused finalize, pooler/unpooler gathers and o_proj all-reduce boundary each
+synchronize the TP ranks with ``peer_sync.grid_barrier`` (one counter per rank,
+every block of every rank arrives on every counter; a system-scope release per
+wave before, an acquire poll after). On MI355X TP4 the gather kernels cost
+15-25 us more than the norm they replace while moving a few KB, so the
+synchronization is the suspect. This times, as graph replays of ``--calls``
+back-to-back launches, a kernel that does nothing but the barrier:
+
+* ``counter``: ``grid_barrier`` as the kernels use it;
+* ``counter-nowave``: the same without the per-wave release (one release per
+  block, by the arrival atomic) - the L2 writeback cost;
+* ``flags``: one flag per (writer rank, block) on every rank, each block waits
+  on its own W flags (AITER's custom all-reduce pattern) - the contention cost;
+
+over a sweep of block counts and waves per block, against an empty launch of
+the same grid and a custom all-reduce of a [1, 8192] bf16 tensor.
+
+Usage:
+    torchrun --nproc_per_node=4 \\
+        benchmarks/kernels/benchmark_muse_spark_rocm_peer_barrier.py
+"""
+
+import itertools
+import os
+
+import torch
+import torch.distributed as dist
+from benchmark_muse_spark_rocm_column_gather import _time_graph
+
+from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.distributed import (
+    get_tp_group,
+    init_distributed_environment,
+    initialize_model_parallel,
+    tensor_model_parallel_all_reduce,
+)
+from vllm.models.muse_spark.amd.ops.peer_sync import (
+    PeerBuffer,
+    grid_barrier,
+    peer,
+)
+from vllm.triton_utils import tl, triton
+from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+
+@triton.jit
+def _barrier_no_wave_release(
+    P, rank, count_off, target, W: tl.constexpr, NUM_WAVES: tl.constexpr
+):
+    mine = peer(P, rank, tl.int32) + count_off
+    tl.debug_barrier()
+    for r in tl.static_range(W):
+        tl.atomic_add(peer(P, r, tl.int32) + count_off, 1, sem="release", scope="sys")
+    seen = tl.atomic_add(mine, 0, sem="acquire", scope="sys")
+    while seen - target < 0:
+        seen = tl.atomic_add(mine, 0, sem="acquire", scope="sys")
+    tl.debug_barrier()
+
+
+@triton.jit
+def _barrier_flags(P, rank, flags_off, target, W: tl.constexpr, NB: tl.constexpr):
+    """Flag ``[writer][block]`` on every rank; block ``b`` waits on its W flags."""
+    b = tl.program_id(0)
+    tl.debug_barrier()
+    for r in tl.static_range(W):
+        tl.atomic_xchg(
+            peer(P, r, tl.int32) + flags_off + rank * NB + b,
+            target,
+            sem="release",
+            scope="sys",
+        )
+    mine = peer(P, rank, tl.int32) + flags_off + b
+    for s in tl.static_range(W):
+        seen = tl.atomic_add(mine + s * NB, 0, sem="acquire", scope="sys")
+        while seen - target < 0:
+            seen = tl.atomic_add(mine + s * NB, 0, sem="acquire", scope="sys")
+    tl.debug_barrier()
+
+
+@triton.jit
+def _barrier_kernel(
+    P,
+    rank,
+    count_off,
+    target_off,
+    flags_off,
+    W: tl.constexpr,
+    NB: tl.constexpr,
+    NUM_WAVES: tl.constexpr,
+    MODE: tl.constexpr,
+):
+    b = tl.program_id(0)
+    target = tl.load(peer(P, rank, tl.int32) + target_off + b) + W * NB
+    if MODE == 0:
+        grid_barrier(P, rank, count_off, target, W, NUM_WAVES)
+    elif MODE == 1:
+        _barrier_no_wave_release(P, rank, count_off, target, W, NUM_WAVES)
+    else:
+        _barrier_flags(P, rank, flags_off, target, W, NB)
+    tl.store(peer(P, rank, tl.int32) + target_off + b, target)
+
+
+@triton.jit
+def _empty_kernel(x_ptr):
+    tl.store(x_ptr + tl.program_id(0), 0)
+
+
+MODES = {"counter": 0, "counter-nowave": 1, "flags": 2}
+
+
+def main() -> None:
+    parser = FlexibleArgumentParser()
+    parser.add_argument("--blocks", type=int, nargs="+", default=[64, 16, 4, 1])
+    parser.add_argument("--waves", type=int, nargs="+", default=[16, 8, 1])
+    parser.add_argument("--calls", type=int, default=16)
+    parser.add_argument("--iters", type=int, default=50)
+    args = parser.parse_args()
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    torch.accelerator.set_device_index(local_rank)
+    device = torch.device("cuda", local_rank)
+    with set_current_vllm_config(VllmConfig()):
+        init_distributed_environment(
+            world_size, int(os.environ["RANK"]), local_rank=local_rank
+        )
+        initialize_model_parallel(tensor_model_parallel_size=world_size)
+    tp = get_tp_group()
+    rank = tp.rank_in_group
+
+    configs = list(itertools.product(MODES, args.blocks, args.waves))
+    max_blocks = max(args.blocks)
+    # Per config: a counter, NB targets and 8 * NB flags (int32), disjoint so
+    # the configs never see each other's arrivals.
+    stride = 1 + max_blocks + 8 * max_blocks
+    buffer = PeerBuffer(len(configs) * stride * 4, tp.cpu_group)
+    P = buffer.peers
+    scratch = torch.zeros(max_blocks, dtype=torch.int32, device=device)
+    x = torch.randn(1, 8192, device=device).bfloat16()
+
+    def barrier(index, mode, blocks, waves):
+        base = index * stride
+
+        def fn(i):
+            _barrier_kernel[(blocks,)](
+                P,
+                rank,
+                base,
+                base + 1,
+                base + 1 + max_blocks,
+                W=world_size,
+                NB=blocks,
+                NUM_WAVES=waves,
+                MODE=MODES[mode],
+                num_warps=waves,
+            )
+
+        return fn
+
+    if rank == 0:
+        print(f"TP{world_size}, us per call")
+    for blocks in args.blocks:
+        us = _time_graph(
+            lambda i, b=blocks: _empty_kernel[(b,)](scratch, num_warps=1),
+            args.calls,
+            args.iters,
+        )
+        if rank == 0:
+            print(f"empty launch, {blocks:>3} blocks: {us:6.1f}")
+    us = _time_graph(
+        lambda i: tensor_model_parallel_all_reduce(x), args.calls, args.iters
+    )
+    if rank == 0:
+        print(f"custom all-reduce [1, 8192] bf16: {us:6.1f}")
+        print(f"\n{'barrier':<16} {'blocks':>6} {'waves':>5} {'us':>7}")
+    for index, (mode, blocks, waves) in enumerate(configs):
+        us = _time_graph(barrier(index, mode, blocks, waves), args.calls, args.iters)
+        torch.accelerator.synchronize()
+        dist.barrier(group=tp.cpu_group)
+        if rank == 0:
+            print(f"{mode:<16} {blocks:>6} {waves:>5} {us:7.1f}")
+    buffer.close()
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
