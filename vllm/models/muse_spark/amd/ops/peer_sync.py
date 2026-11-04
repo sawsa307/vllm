@@ -85,10 +85,12 @@ def grid_barrier(
             scope="sys",
         )
     flags = mine + flags_off + tl.arange(0, W * NB)
-    # Wrapping difference: the targets overflow after ~2^31 arrivals.
-    seen = tl.load(flags, volatile=True)
-    while tl.min(seen - target, axis=0) < 0:
-        seen = tl.load(flags, volatile=True)
+    # Wrapping difference: the targets overflow after ~2^31 arrivals. The loop
+    # carries the scalar, not the flag vector (a vector carry fails to compile
+    # at one wave).
+    behind = tl.min(tl.load(flags, volatile=True) - target, axis=0)
+    while behind < 0:
+        behind = tl.min(tl.load(flags, volatile=True) - target, axis=0)
     # Acquire after the successful poll, so the data reads that follow are not
     # reordered before it.
     tl.atomic_add(mine + flags_off + rank * NB + b, 0, sem="acquire", scope="sys")
