@@ -39,9 +39,11 @@ from .peer_sync import (
     NUM_BLOCKS,
     PeerBuffer,
     all_tp_ranks,
+    barrier_words,
     grid_barrier,
     peer,
     tp_group_supports_peer_kernels,
+    wave_words,
 )
 
 logger = init_logger(__name__)
@@ -83,8 +85,9 @@ def _finalize_all_reduce_kernel(
     gain_center,
     slots_off,
     gathered_off,
-    count_a_off,
-    count_b_off,
+    flags_a_off,
+    flags_b_off,
+    wave_off,
     target_off,
     W: tl.constexpr,
     K: tl.constexpr,
@@ -144,7 +147,7 @@ def _finalize_all_reduce_kernel(
                             y = _norm_route(x, w, eps, H, HAS_WEIGHT, WEIGHT_FIRST)
                             acc += y * tw
                     tl.store(partial_dst + g * H + offs, acc, mask=mask)
-    grid_barrier(P, rank, count_a_off, target, W, NUM_WAVES)
+    grid_barrier(P, rank, flags_a_off, wave_off, target, W, NB, NUM_WAVES)
 
     # B: reduce this rank's tokens and push each output row to every rank.
     for g in range(b, groups, NB):
@@ -170,7 +173,7 @@ def _finalize_all_reduce_kernel(
             for r in tl.static_range(W):
                 gathered = peer(P, r, tl.bfloat16) + gathered_off
                 tl.store(gathered + t * H + offs, res, mask=mask)
-    grid_barrier(P, rank, count_b_off, target, W, NUM_WAVES)
+    grid_barrier(P, rank, flags_b_off, wave_off, target, W, NB, NUM_WAVES)
 
     # C: copy the gathered rows out.
     for t in range(b, T, NB):
@@ -212,12 +215,13 @@ class MuseSparkFinalizeAllReduce:
         self.slots_off = 0
         gathered_off = self.world_size * self.slots_per_rank * slot_bytes
         sync_off = gathered_off + max_tokens * hidden_size * 2
-        nbytes = sync_off + (2 + NUM_BLOCKS) * 4
         # Element offsets for the kernel's typed base pointers.
         self.gathered_off = gathered_off // 2
-        self.count_a_off = sync_off // 4
-        self.count_b_off = self.count_a_off + 1
-        self.target_off = self.count_a_off + 2
+        self.flags_a_off = sync_off // 4
+        self.flags_b_off = self.flags_a_off + barrier_words(self.world_size)
+        self.wave_off = self.flags_b_off + barrier_words(self.world_size)
+        self.target_off = self.wave_off + wave_words()
+        nbytes = sync_off + (self.target_off - self.flags_a_off + NUM_BLOCKS) * 4
         self.buffer = PeerBuffer(nbytes, group)
 
     def supports(self, routed: torch.Tensor, out: torch.Tensor) -> bool:
@@ -279,8 +283,9 @@ class MuseSparkFinalizeAllReduce:
             gain_center,
             self.slots_off,
             self.gathered_off,
-            self.count_a_off,
-            self.count_b_off,
+            self.flags_a_off,
+            self.flags_b_off,
+            self.wave_off,
             self.target_off,
             W=self.world_size,
             K=top_k,

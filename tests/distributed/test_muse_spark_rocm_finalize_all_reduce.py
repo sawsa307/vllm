@@ -34,6 +34,21 @@ def _reference(partials, weight, topk_weights, weight_first):
     return (y * topk_weights.float()[..., None]).sum(1)
 
 
+def _bf16_ulp(t: torch.Tensor) -> torch.Tensor:
+    """One BF16 unit in the last place at each element of ``t``, in fp64."""
+    exponent = torch.frexp(t.double().abs().clamp_min(2.0**-126).float())[1]
+    return torch.ldexp(torch.ones_like(t, dtype=torch.float64), exponent - 8)
+
+
+def _exact_finalize(rows, weight, topk_weights):
+    """The weight-first post-expert finalize of ``rows`` in fp64, plus a bound
+    on the fp32 accumulation error of any kernel that computes it in fp32."""
+    x = rows.double() * (weight.double() + 1.0)
+    y = x / torch.sqrt(x.square().mean(-1, keepdim=True) + EPS)
+    terms = y * topk_weights.double()[..., None]
+    return terms.sum(1), 2.0**-20 * terms.abs().sum(1)
+
+
 @ray.remote(num_gpus=1, max_calls=1)
 def _fused_finalize_all_reduce(monkeypatch, tp_size, pp_size, rank, port):
     from vllm.distributed import get_tp_group
@@ -172,10 +187,15 @@ def _fused_finalize_all_reduce_ep(monkeypatch, tp_size, pp_size, rank, port):
                     topk_ids=ids if use_map else None,
                     expert_map=expert_map if use_map else None,
                 )
-                ref = _reference([full], weight, tw, True)
-                torch.testing.assert_close(out.float(), ref, atol=1.5e-2, rtol=1e-2)
-                # The unfused production path: local finalize, then all-reduce.
-                unfused = torch.empty_like(out)
+                exact, slack = _exact_finalize(full, weight, tw)
+                # The partials are summed in fp32 and rounded to bf16 once.
+                err = (out.double() - exact).abs()
+                assert (err <= _bf16_ulp(exact) + slack).all(), err.max()
+                # The unfused production path rounds each rank's partial to
+                # bf16 and all-reduces in bf16: half an ulp per partial and per
+                # add. A fixed tolerance against it fails with the TP size
+                # (cancelling partials round at their own, larger magnitude).
+                partial = torch.empty_like(out)
                 fused_post_expert_finalize(
                     rows,
                     weight,
@@ -183,12 +203,23 @@ def _fused_finalize_all_reduce_ep(monkeypatch, tp_size, pp_size, rank, port):
                     EPS,
                     1.0,
                     True,
-                    unfused,
+                    partial,
                     topk_ids=ids if use_map else None,
                     expert_map=expert_map if use_map else None,
                 )
+                parts = [torch.empty_like(partial) for _ in range(tp_size)]
+                dist.all_gather(parts, partial, group=group.device_group)
+                unfused = partial.clone()
                 dist.all_reduce(unfused, group=group.device_group)
-                torch.testing.assert_close(out, unfused, atol=1.5e-2, rtol=1e-2)
+                abs_sum = sum(p.double().abs() for p in parts)
+                unfused_bound = (
+                    0.5 * sum(_bf16_ulp(p) for p in parts)
+                    + 0.5 * (tp_size - 1) * _bf16_ulp(abs_sum)
+                    + slack
+                )
+                assert ((unfused.double() - exact).abs() <= unfused_bound).all()
+                diff = (out.double() - unfused.double()).abs()
+                assert (diff <= _bf16_ulp(exact) + slack + unfused_bound).all()
                 gathered = [torch.empty_like(out) for _ in range(tp_size)]
                 dist.all_gather(gathered, out, group=group.device_group)
                 for other in gathered:

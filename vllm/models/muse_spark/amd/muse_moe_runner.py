@@ -94,7 +94,7 @@ def _validate_tp_post_norm_deployment(
         raise NotImplementedError(
             f"MuseSpark1x {precision} on ROCm does not support MoE LoRA."
         )
-    if moe_config.skip_final_all_reduce:
+    if moe_config.skip_final_all_reduce and needs_pre_norm_all_reduce(moe_config):
         raise NotImplementedError(
             f"MuseSpark1x {precision} performs the TP reduction before its post-expert "
             "norm and cannot return an unreduced MoE output."
@@ -1000,8 +1000,12 @@ class MuseMoERunner(MoERunner):
     @property
     def _fused_output_is_reduced(self) -> bool:
         fused = get_finalize_all_reduce()
+        # With skip_final_all_reduce the MoE block reduces the output itself and
+        # reads the fused finalize's flag directly.
         return needs_pre_norm_all_reduce(self.moe_config) or (
-            fused is not None and fused.output_reduced
+            fused is not None
+            and fused.output_reduced
+            and not self.moe_config.skip_final_all_reduce
         )
 
 

@@ -16,9 +16,12 @@ as graph replays of ``--calls`` back-to-back calls:
 The weights are allocated per layer (``--layers`` copies, cycled) so that
 they stream from HBM as in a forward instead of staying in cache.
 
+With ``--breakdown`` it also times each GEMM and each norm / gather kernel on
+its own, to tell a slow shard GEMM from a slow gather.
+
 Usage:
     torchrun --nproc_per_node=4 \\
-        benchmarks/kernels/benchmark_muse_spark_rocm_column_gather.py
+        benchmarks/kernels/benchmark_muse_spark_rocm_column_gather.py [--breakdown]
 """
 
 import os
@@ -47,6 +50,7 @@ from vllm.models.muse_spark.common.ops.fused_rmsnorm import (
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 HIDDEN, POOLED = 8192, 4096
+WIDTHS = (9, 7, 6, 7, 11, 7, 6, 7)
 
 
 def _time_graph(fn, calls: int, iters: int) -> float:
@@ -82,6 +86,11 @@ def main() -> None:
     parser.add_argument("--layers", type=int, default=8)
     parser.add_argument("--calls", type=int, default=16)
     parser.add_argument("--iters", type=int, default=50)
+    parser.add_argument(
+        "--breakdown",
+        action="store_true",
+        help="also time each GEMM and each norm/gather kernel on its own",
+    )
     args = parser.parse_args()
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -130,6 +139,55 @@ def main() -> None:
 
     def layer(i: int) -> int:
         return i % args.layers
+
+    breakdown: list[tuple[int, list[float]]] = []
+
+    def _breakdown(n, x, e, stream) -> list[float]:
+        """Each piece of the four paths above, timed on its own."""
+        pooled = F.linear(x, pooler[0])
+        unpooled = F.linear(e, unpooler[0])
+        pool_cols = pooled[:, rank * pb : (rank + 1) * pb].contiguous()
+        unpool_cols = unpooled[:, rank * ub : (rank + 1) * ub].contiguous()
+
+        def pool_norm(i):
+            fused_rmsnorm_expand(
+                pooled,
+                pre_expert.weight,
+                pre_expert.variance_epsilon,
+                pre_expert.fused_gain_center,
+                False,
+                args.top_k,
+            )
+
+        def unpool_boundary(i):
+            fused_norm_residual_norm_fwd(
+                unpooled,
+                stream,
+                post.weight,
+                pre.weight,
+                post.variance_epsilon,
+                pre.variance_epsilon,
+                alpha=connection.alpha,
+                beta=connection.beta,
+                post_gain_center=post.fused_gain_center,
+                pre_gain_center=pre.fused_gain_center,
+                post_input_scale=True,
+                out_dtype=torch.bfloat16,
+            )
+
+        fns = (
+            lambda i: F.linear(x, pooler[layer(i)]),
+            lambda i: F.linear(x, pooler[layer(i)][rank * pb : (rank + 1) * pb]),
+            pool_norm,
+            lambda i: gather.gather_rmsnorm(pool_cols, pre_expert, args.top_k),
+            lambda i: F.linear(e, unpooler[layer(i)]),
+            lambda i: F.linear(e, unpooler[layer(i)][rank * ub : (rank + 1) * ub]),
+            unpool_boundary,
+            lambda i: gather.gather_boundary(
+                unpool_cols, stream, post, connection, pre, torch.bfloat16
+            ),
+        )
+        return [_time_graph(fn, args.calls, args.iters) for fn in fns]
 
     for n in args.tokens:
         x = torch.randn(n, HIDDEN, device=device).bfloat16()
@@ -181,6 +239,17 @@ def main() -> None:
                 f"{n:>7} {times[0]:>10.1f} {times[1]:>11.1f} "
                 f"{times[2]:>12.1f} {times[3]:>13.1f}"
             )
+        if args.breakdown:
+            breakdown.append((n, _breakdown(n, x, e, stream)))
+
+    if args.breakdown and rank == 0:
+        print("\nbreakdown, us per call: GEMM alone | norm or gather kernel alone")
+        print(
+            f"{'tokens':>7} {'pool gemm':>9} {'shard':>7} {'norm':>6} {'gather':>7}"
+            f" {'unpool gemm':>11} {'shard':>7} {'bndry':>6} {'gather':>7}"
+        )
+        for n, t in breakdown:
+            print(f"{n:>7} " + " ".join(f"{v:>{w}.1f}" for v, w in zip(t, WIDTHS)))
     gather.close()
     dist.destroy_process_group()
 

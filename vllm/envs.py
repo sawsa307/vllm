@@ -144,6 +144,12 @@ if TYPE_CHECKING:
     VLLM_ROCM_MUSE_MOE_ONLINE_QUANT: str = ""
     VLLM_ROCM_MUSE_FUSED_FINALIZE_ALL_REDUCE: bool = True
     VLLM_ROCM_MUSE_SHARD_PROJECTIONS: bool = True
+    VLLM_ROCM_MUSE_SHARD_PROJECTIONS_MAX_TOKENS: int = 256
+    VLLM_ROCM_MUSE_FUSED_ATTN_ALL_REDUCE: bool = True
+    VLLM_ROCM_MUSE_ATTN_ALL_REDUCE_ONE_SHOT_MAX_TOKENS: int = 32
+    VLLM_ROCM_MUSE_FP32_ROUTER_INPUT: bool = False
+    VLLM_ROCM_MUSE_TOKEN_SHARDED: bool = True
+    VLLM_ROCM_MUSE_AITER_TOKEN_COLLECTIVES: bool = False
     VLLM_ROCM_MUSE_MOE_ROUTE_MODE: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
@@ -1339,6 +1345,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # norm that follows. The full weights stay loaded.
     "VLLM_ROCM_MUSE_SHARD_PROJECTIONS": lambda: (
         os.getenv("VLLM_ROCM_MUSE_SHARD_PROJECTIONS", "1").lower() in ("true", "1")
+    ),
+    # Largest batch (at most 256 tokens) that VLLM_ROCM_MUSE_SHARD_PROJECTIONS
+    # column-shards; larger batches run the full pooler and unpooler.
+    "VLLM_ROCM_MUSE_SHARD_PROJECTIONS_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_ROCM_MUSE_SHARD_PROJECTIONS_MAX_TOKENS", "256")
+    ),
+    # Muse Spark on ROCm, TP > 1: at decode sizes run the attention output
+    # projection without its all-reduce and reduce it inside the residual
+    # boundary kernel that follows.
+    "VLLM_ROCM_MUSE_FUSED_ATTN_ALL_REDUCE": lambda: (
+        os.getenv("VLLM_ROCM_MUSE_FUSED_ATTN_ALL_REDUCE", "1").lower() in ("true", "1")
+    ),
+    # Largest batch that VLLM_ROCM_MUSE_FUSED_ATTN_ALL_REDUCE reduces one-shot
+    # (every rank reads every partial); larger batches use two-shot (each rank
+    # reduces its share of the rows and sends them back), which moves half the
+    # data over the links for one more cross-rank barrier.
+    "VLLM_ROCM_MUSE_ATTN_ALL_REDUCE_ONE_SHOT_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_ROCM_MUSE_ATTN_ALL_REDUCE_ONE_SHOT_MAX_TOKENS", "32")
+    ),
+    # Muse Spark on ROCm (experimental, off by default): for 33-128 tokens feed
+    # the MoE router the unrounded FP32 pre-FFN-norm output, as on CUDA, instead
+    # of the BF16 one (the BF16x3 router keeps only its weights in FP32).
+    "VLLM_ROCM_MUSE_FP32_ROUTER_INPUT": lambda: (
+        os.getenv("VLLM_ROCM_MUSE_FP32_ROUTER_INPUT", "0").lower() in ("true", "1")
+    ),
+    # Muse Spark on ROCm with EP over the whole TP group and DP1: keep the
+    # residual stream split over tokens for batches of 256+ tokens.
+    "VLLM_ROCM_MUSE_TOKEN_SHARDED": lambda: (
+        os.getenv("VLLM_ROCM_MUSE_TOKEN_SHARDED", "1").lower() in ("true", "1")
+    ),
+    # Muse Spark on ROCm, token-sharded stream (experimental, off by default):
+    # run its token all-gathers and reduce-scatters through AITER's custom
+    # collectives, in chunks that fit their IPC buffer, instead of RCCL.
+    "VLLM_ROCM_MUSE_AITER_TOKEN_COLLECTIVES": lambda: (
+        os.getenv("VLLM_ROCM_MUSE_AITER_TOKEN_COLLECTIVES", "0").lower()
+        in ("true", "1")
     ),
     # Muse Spark on ROCm: take the AITER MXFP4 experts' per-route rows from
     # fused_moe(per_slot_output=) when the installed AITER has it, instead of

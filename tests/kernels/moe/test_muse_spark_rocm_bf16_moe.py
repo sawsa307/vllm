@@ -457,7 +457,15 @@ def test_post_expert_norm_precedes_router_weight_and_topk_reduce() -> None:
     assert not torch.allclose(actual.float(), wrong_order)
 
 
-def test_tp_partial_routes_are_reduced_before_norm(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("reduce_dtype", "dtype"), [("fp32", torch.float32), ("bf16", torch.bfloat16)]
+)
+def test_tp_partial_routes_are_reduced_before_norm(
+    monkeypatch, reduce_dtype: str, dtype: torch.dtype
+) -> None:
+    """The route rows are all-reduced in VLLM_ROCM_MUSE_MOE_REDUCE_DTYPE, then
+    normalized (the recipe sets bf16; the default is fp32)."""
+    monkeypatch.setattr(envs, "VLLM_ROCM_MUSE_MOE_REDUCE_DTYPE", reduce_dtype)
     routed = torch.tensor([[[1.0, 2.0], [3.0, 5.0]]], dtype=torch.bfloat16)
     peer = torch.tensor([[[7.0, 11.0], [13.0, 17.0]]], dtype=torch.float32)
     weights = torch.tensor([[0.25, 0.75]])
@@ -467,8 +475,9 @@ def test_tp_partial_routes_are_reduced_before_norm(monkeypatch) -> None:
 
     def _all_reduce(x: torch.Tensor) -> torch.Tensor:
         calls.append(x.clone())
-        assert x.dtype == torch.float32
-        return x + peer
+        assert x.dtype == dtype
+        # An all-reduce returns its input dtype.
+        return (x.float() + peer).to(x.dtype)
 
     monkeypatch.setattr(
         "vllm.models.muse_spark.amd.muse_moe_runner.tensor_model_parallel_all_reduce",
@@ -484,7 +493,7 @@ def test_tp_partial_routes_are_reduced_before_norm(monkeypatch) -> None:
     reducer = MuseSparkTopKWeightAndReduce(_tracked_norm, pre_norm_all_reduce=True)
     actual = reducer.apply(None, routed, weights, ids, False)
 
-    reduced = routed.float() + peer
+    reduced = (routed.float() + peer).to(dtype)
     expected = (
         (_rms_norm(reduced, out_dtype=torch.float32) * weights[..., None].float())
         .sum(dim=1)
@@ -492,7 +501,7 @@ def test_tp_partial_routes_are_reduced_before_norm(monkeypatch) -> None:
     )
     torch.testing.assert_close(actual, expected)
     assert len(calls) == 1
-    assert norm_calls == [(torch.float32, torch.float32)]
+    assert norm_calls == [(dtype, torch.float32)]
 
 
 def test_finalize_is_chunk_invariant() -> None:
@@ -516,7 +525,13 @@ _FAIL_CLOSED_EVERYWHERE = [
     (_moe_config(parallel_config=_parallel_config(sp_size=2)), "sequence"),
     (_moe_config(parallel_config=_parallel_config(enable_eplb=True)), "EPLB"),
     (_moe_config(is_lora_enabled=True), "LoRA"),
-    (_moe_config(skip_final_all_reduce=True), "unreduced"),
+    # Under TP the output exists only after the pre-norm all-reduce.
+    (
+        _moe_config(
+            parallel_config=_parallel_config(tp_size=2), skip_final_all_reduce=True
+        ),
+        "unreduced",
+    ),
 ]
 
 
@@ -535,6 +550,22 @@ def test_unsupported_deployments_fail_closed(
 ) -> None:
     with pytest.raises(NotImplementedError, match=reason):
         validate(config)
+
+
+@pytest.mark.parametrize(
+    "validate",
+    [validate_bf16_deployment, validate_mxfp4_deployment, validate_fp8_deployment],
+)
+def test_expert_parallel_moe_may_leave_the_reduction_to_the_caller(
+    validate: Callable[[FusedMoEConfig], None],
+) -> None:
+    """Under EP (MoE TP1) the output is a sum of per-rank partials that the
+    token-sharded MoE block reduce-scatters itself (skip_final_all_reduce)."""
+    validate(
+        _moe_config(
+            parallel_config=_parallel_config(ep_size=2), skip_final_all_reduce=True
+        )
+    )
 
 
 @pytest.mark.parametrize(
