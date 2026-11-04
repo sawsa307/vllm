@@ -46,6 +46,9 @@ class MuseSpark1xRouter(BaseRouter):
         self.router_output_multiplier = router_output_multiplier
         self.router_score_normalization = router_score_normalization
         self.router_score_division_eps = router_score_division_eps
+        # (topk_weights, topk_ids) for the next _compute_routing call, when the
+        # model routed the batch itself (amd/ops/router_pooler.py).
+        self.precomputed_routing: tuple[torch.Tensor, torch.Tensor] | None = None
 
     @property
     def routing_method_type(self) -> RoutingMethodType:
@@ -67,6 +70,14 @@ class MuseSpark1xRouter(BaseRouter):
         input_ids: torch.Tensor | None = None,
         is_padding: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        precomputed = self.precomputed_routing
+        if precomputed is not None:
+            # Routed by the model's fused router / pooler front.
+            self.precomputed_routing = None
+            topk_weights, topk_ids = precomputed
+            if indices_type is not None and indices_type != topk_ids.dtype:
+                topk_ids = topk_ids.to(indices_type)
+            return topk_weights, topk_ids
         if not router_logits.is_cuda:
             weights, ids = self._compute_routing_native(router_logits, indices_type)
             if is_padding is not None:

@@ -5,11 +5,13 @@
 import functools
 import math
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import ignore_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
@@ -17,6 +19,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -82,6 +85,10 @@ from .ops.router_bf16x3 import (
     split_fp32_to_bf16x3,
     supports_router_bf16x3,
 )
+from .ops.router_pooler import router_pooler_supports, router_pooler_topk
+from .ops.small_m_gemm import rowmajor_gemm, rowmajor_gemm_config
+from .ops.unpool_boundary import MAX_TOKENS as _UNPOOL_MAX_TOKENS
+from .ops.unpool_boundary import unpool_boundary, unpool_boundary_supports
 
 logger = init_logger(__name__)
 
@@ -99,6 +106,24 @@ def _supports_router_bf16x3_device() -> bool:
     return on_gfx950()
 
 
+@dataclass(slots=True)
+class MuseSpark1xUnpoolStream(MuseSpark1xResidualStream):
+    """A residual stream whose branch is the MoE experts' output before the
+    unpooler: the unpooler GEMM is deferred into the next boundary."""
+
+    unpooler: nn.Module | None = None
+
+
+def materialize(x: MuseSpark1xResidualStream) -> MuseSpark1xResidualStream:
+    """The plain stream (deferred unpooler applied) for consumers that do not
+    fuse it."""
+    if isinstance(x, MuseSpark1xUnpoolStream):
+        assert x.unpooler is not None
+        branch, _ = x.unpooler(x.branch)
+        return MuseSpark1xResidualStream(x.stream, branch, x.post_norm, x.connection)
+    return x
+
+
 def norm_residual_then_norm(
     x: MuseSpark1xResidualStream,
     pre_norm: MuseSpark1xRMSNorm,
@@ -106,6 +131,22 @@ def norm_residual_then_norm(
     out_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Post-norm, blend and pre-norm in one kernel; returns ``(out, new_stream)``."""
+    if isinstance(x, MuseSpark1xUnpoolStream):
+        assert x.unpooler is not None
+        weight = x.unpooler.weight
+        if unpool_boundary_supports(
+            x.branch, weight, x.stream, x.post_norm, x.connection, pre_norm
+        ):
+            return unpool_boundary(
+                x.branch,
+                weight,
+                x.stream,
+                x.post_norm,
+                x.connection,
+                pre_norm,
+                out_dtype,
+            )
+        x = materialize(x)
     post_norm, connection = x.post_norm, x.connection
     branch, stream = x.branch, x.stream
     if (
@@ -350,20 +391,99 @@ class MuseSpark1xMoE(nn.Module):
             )
         return norm(hidden_states)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    @functools.cached_property
+    def _fused_front_available(self) -> bool:
+        """Whether the fused router / pooler / norm front can serve this block:
+        AITER MXFP4 experts (expanded input), the bf16x3 router planes, a
+        [4096, 8192] pooler, sigmoid routing, and the runner routing through
+        ``self.moe_router`` (which takes the precomputed result)."""
+        router = self.moe_router
+        runner_router = getattr(self.experts, "router", None) or getattr(
+            getattr(self.experts, "runner", None), "router", None
+        )
+        return (
+            envs.VLLM_ROCM_MUSE_FUSED_ROUTER_POOLER
+            and not self.is_sequence_parallel
+            and self._experts_take_expanded_input
+            and self.pooler is not None
+            and self.pre_expert_norm is not None
+            and getattr(self, "_router_planes", None) is not None
+            and router.router_score_normalization == "sigmoid"
+            and runner_router is router
+            and tuple(self.pooler.weight.shape) == (4096, 8192)
+        )  # type: ignore[union-attr]
+
+    def _fused_front(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Route and pool ``hidden_states`` in one fused front; returns
+        ``(router_logits placeholder, pooled)`` with the routing parked on
+        ``self.moe_router``, or None when the batch is not served."""
+        if not self._fused_front_available:
+            return None
+        planes = self._router_planes
+        pooler, norm = self.pooler, self.pre_expert_norm
+        assert pooler is not None and norm is not None
+        if not router_pooler_supports(hidden_states, planes, pooler.weight):
+            return None
+        router = self.moe_router
+        topk_weights, topk_ids, pooled = router_pooler_topk(
+            hidden_states,
+            planes,
+            pooler.weight,
+            router.expert_bias,
+            norm.weight if norm.has_weight else None,
+            eps=norm.variance_epsilon,
+            gain_center=norm.fused_gain_center,
+            input_scale=norm.applies_weight_before_norm and norm.has_weight,
+            repeats=self.top_k,
+            multiplier=router.router_output_multiplier or 1.0,
+            route_scale=router.route_scale,
+            division_eps=router.router_score_division_eps or 0.0,
+            top_k=self.top_k,
+        )
+        router.precomputed_routing = (topk_weights, topk_ids)
+        placeholder = hidden_states.new_empty(
+            (hidden_states.shape[0], self.num_experts), dtype=torch.float32
+        )
+        return placeholder, pooled
+
+    def defers_unpool(self, hidden_states: torch.Tensor) -> bool:
+        """Whether the unpooler GEMM can be left to the next boundary."""
+        unpooler = self.unpooler
+        return (
+            envs.VLLM_ROCM_MUSE_FUSED_UNPOOL_BOUNDARY
+            and unpooler is not None
+            and not self.is_sequence_parallel
+            and hidden_states.dim() == 2
+            and 0 < hidden_states.shape[0] <= _UNPOOL_MAX_TOKENS
+            and unpooler.weight.dtype == torch.bfloat16
+            and tuple(unpooler.weight.shape) == (8192, 4096)
+        )
+
+    def forward(
+        self, hidden_states: torch.Tensor, defer_unpool: bool = False
+    ) -> torch.Tensor:
+        """With ``defer_unpool`` returns the experts' output before the
+        unpooler (see :meth:`defers_unpool`)."""
         num_tokens = hidden_states.shape[0]
         if self.is_sequence_parallel:
+            assert not defer_unpool
             hidden_states = sequence_parallel_chunk(hidden_states)
 
-        router_logits = self._router_logits(hidden_states)
-        hidden_states = self._pool(hidden_states)
+        front = self._fused_front(hidden_states)
+        if front is not None:
+            router_logits, hidden_states = front
+        else:
+            router_logits = self._router_logits(hidden_states)
+            hidden_states = self._pool(hidden_states)
 
         experts_out = self.experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
         )
 
-        if self.unpooler is not None:
+        if self.unpooler is not None and not defer_unpool:
             experts_out, _ = self.unpooler(experts_out)
 
         if self.is_sequence_parallel:
@@ -657,7 +777,7 @@ class MuseSpark1xAttention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         """Attention over an input the caller has already normalized."""
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv = self._project_qkv(hidden_states)
 
         q, k, v, og = self._qk_norm_rope_kv_insert(qkv, positions)
 
@@ -695,7 +815,36 @@ class MuseSpark1xAttention(nn.Module):
                 attn_output = og.sigmoid() * attn_output
 
         attn_output = attn_output.view(-1, self.num_heads * self.head_dim)
-        output, _ = self.o_proj(attn_output)
+        return self._project_o(attn_output)
+
+    @staticmethod
+    def _small_m_gemm_applies(x: torch.Tensor, layer: nn.Module) -> bool:
+        weight = layer.weight
+        return (
+            envs.VLLM_ROCM_MUSE_SMALL_M_GEMM
+            and getattr(layer, "bias", None) is None
+            and x.dim() == 2
+            and x.dtype == weight.dtype == torch.bfloat16
+            and x.is_contiguous()
+            and weight.is_contiguous()
+            and rowmajor_gemm_config(weight.shape[0], weight.shape[1], x.shape[0])
+            is not None
+        )
+
+    def _project_qkv(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._small_m_gemm_applies(hidden_states, self.qkv_proj):
+            return rowmajor_gemm(hidden_states, self.qkv_proj.weight)
+        qkv, _ = self.qkv_proj(hidden_states)
+        return qkv
+
+    def _project_o(self, attn_output: torch.Tensor) -> torch.Tensor:
+        o_proj = self.o_proj
+        if self._small_m_gemm_applies(attn_output, o_proj):
+            output = rowmajor_gemm(attn_output, o_proj.weight)
+            if o_proj.reduce_results and o_proj.tp_size > 1:
+                output = tensor_model_parallel_all_reduce(output)
+            return output
+        output, _ = o_proj(attn_output)
         return output
 
 
@@ -864,7 +1013,16 @@ class MuseSpark1xDecoderLayer(nn.Module):
             self.pre_ffn_norm,
             out_dtype=self.default_dtype,
         )
-        branch = self.feed_forward(ffn_in)
+        moe = self.feed_forward
+        if isinstance(moe, MuseSpark1xMoE) and moe.defers_unpool(ffn_in):
+            return MuseSpark1xUnpoolStream(
+                stream=stream,
+                branch=moe(ffn_in, defer_unpool=True),
+                post_norm=self.post_ffn_norm,
+                connection=self.add_ffn,
+                unpooler=moe.unpooler,
+            )
+        branch = moe(ffn_in)
         return MuseSpark1xResidualStream(
             stream=stream,
             branch=branch,
@@ -978,10 +1136,10 @@ class MuseSpark1xModel(LlamaModel):
         ):
             x = layer(positions, x)
             if not self.fuse_across_layers and isinstance(x, MuseSpark1xResidualStream):
-                x = norm_then_gated_residual(x)
+                x = norm_then_gated_residual(materialize(x))
             if idx + 1 in self.aux_hidden_state_layers:
                 state = (
-                    norm_then_gated_residual(x)
+                    norm_then_gated_residual(materialize(x))
                     if isinstance(x, MuseSpark1xResidualStream)
                     else x
                 )

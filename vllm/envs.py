@@ -142,6 +142,9 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
     VLLM_ROCM_MUSE_MOE_REDUCE_DTYPE: str = "fp32"
     VLLM_ROCM_MUSE_MOE_ONLINE_QUANT: str = ""
+    VLLM_ROCM_MUSE_SMALL_M_GEMM: bool = True
+    VLLM_ROCM_MUSE_FUSED_ROUTER_POOLER: bool = True
+    VLLM_ROCM_MUSE_FUSED_UNPOOL_BOUNDARY: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1322,6 +1325,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ).lower(),
     # Muse Spark on ROCm: online-quantize routed experts ("" or "mxfp4"; first
     # and last layer stay BF16).
+    # Muse Spark on ROCm: run the attention QKV / O projections at decode widths
+    # (up to 128 rows) on the split-K small-M GEMM instead of hipBLASLt.
+    "VLLM_ROCM_MUSE_SMALL_M_GEMM": lambda: (
+        os.getenv("VLLM_ROCM_MUSE_SMALL_M_GEMM", "1").lower() in ("true", "1")
+    ),
+    # Muse Spark on ROCm: at decode widths fuse the router GEMM, routing, pooler
+    # GEMM and pre-expert norm into one epilogue (three launches for five).
+    "VLLM_ROCM_MUSE_FUSED_ROUTER_POOLER": lambda: (
+        os.getenv("VLLM_ROCM_MUSE_FUSED_ROUTER_POOLER", "1").lower() in ("true", "1")
+    ),
+    # Muse Spark on ROCm: at decode widths fuse the MoE unpooler GEMM into the
+    # residual boundary that follows it.
+    "VLLM_ROCM_MUSE_FUSED_UNPOOL_BOUNDARY": lambda: (
+        os.getenv("VLLM_ROCM_MUSE_FUSED_UNPOOL_BOUNDARY", "1").lower() in ("true", "1")
+    ),
     "VLLM_ROCM_MUSE_MOE_ONLINE_QUANT": lambda: os.getenv(
         "VLLM_ROCM_MUSE_MOE_ONLINE_QUANT", ""
     ).lower(),
