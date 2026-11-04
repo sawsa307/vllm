@@ -525,7 +525,13 @@ _FAIL_CLOSED_EVERYWHERE = [
     (_moe_config(parallel_config=_parallel_config(sp_size=2)), "sequence"),
     (_moe_config(parallel_config=_parallel_config(enable_eplb=True)), "EPLB"),
     (_moe_config(is_lora_enabled=True), "LoRA"),
-    (_moe_config(skip_final_all_reduce=True), "unreduced"),
+    # Under TP the output exists only after the pre-norm all-reduce.
+    (
+        _moe_config(
+            parallel_config=_parallel_config(tp_size=2), skip_final_all_reduce=True
+        ),
+        "unreduced",
+    ),
 ]
 
 
@@ -544,6 +550,22 @@ def test_unsupported_deployments_fail_closed(
 ) -> None:
     with pytest.raises(NotImplementedError, match=reason):
         validate(config)
+
+
+@pytest.mark.parametrize(
+    "validate",
+    [validate_bf16_deployment, validate_mxfp4_deployment, validate_fp8_deployment],
+)
+def test_expert_parallel_moe_may_leave_the_reduction_to_the_caller(
+    validate: Callable[[FusedMoEConfig], None],
+) -> None:
+    """Under EP (MoE TP1) the output is a sum of per-rank partials that the
+    token-sharded MoE block reduce-scatters itself (skip_final_all_reduce)."""
+    validate(
+        _moe_config(
+            parallel_config=_parallel_config(ep_size=2), skip_final_all_reduce=True
+        )
+    )
 
 
 @pytest.mark.parametrize(

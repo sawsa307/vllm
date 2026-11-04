@@ -6,6 +6,7 @@ Ported from vllm-project/vllm#63722 and #63723 (Mikko Tukiainen), plus the
 small-batch reduction with the fused finalize in front of it.
 """
 
+import contextlib
 import os
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -134,27 +135,108 @@ def _check_moe_block(rank: int, config: VllmConfig) -> None:
         torch.testing.assert_close(actual, expected, atol=0.002, rtol=0.02)
 
 
+def _bf16_ulp(t: torch.Tensor) -> torch.Tensor:
+    """One BF16 unit in the last place at each element of ``t``, in fp64."""
+    exponent = torch.frexp(t.double().abs().clamp_min(2.0**-126).float())[1]
+    return torch.ldexp(torch.ones_like(t, dtype=torch.float64), exponent - 8)
+
+
 def _check_small_batch_reduces_once(rank: int, config: VllmConfig) -> None:
     """Below the threshold the block all-reduces the expert output itself,
-    unless the fused EP finalize already did: either way exactly once."""
+    unless the fused EP finalize already did: either way exactly once.
+
+    The fused finalize sums the ranks' fp32 partials and rounds once; the
+    unfused path rounds each partial to bf16 and all-reduces in bf16, so the
+    two differ by rounding (most where partials cancel). Both are checked
+    against the exact sum of the gathered bf16 partials within derived
+    bounds, which a doubled or missing reduction exceeds.
+    """
+    from vllm.distributed import get_tp_group
     from vllm.models.muse_spark.amd import muse_moe_runner
+    from vllm.models.muse_spark.amd.ops.fused_finalize_all_reduce import (
+        get_finalize_all_reduce,
+    )
 
     block = _make_moe(config, rank)
+    fused = get_finalize_all_reduce()
+    world = get_tp_group().world_size
+    counts = {"all_reduce": 0, "fused": 0}
+    partials: list[torch.Tensor] = []
+    unpooler_inputs: list[torch.Tensor] = []
+    all_reduce = muse_model.tensor_model_parallel_all_reduce
+
+    def _counted_all_reduce(x: torch.Tensor) -> torch.Tensor:
+        counts["all_reduce"] += 1
+        partials.append(x.clone())
+        return all_reduce(x)
+
+    patches = [
+        patch.object(
+            muse_model, "tensor_model_parallel_all_reduce", _counted_all_reduce
+        )
+    ]
+    if fused is not None:
+        call = type(fused).__call__
+
+        def _counted_fused(self, *args, **kwargs):
+            counts["fused"] += 1
+            return call(self, *args, **kwargs)
+
+        patches.append(patch.object(type(fused), "__call__", _counted_fused))
     no_fused = [
         patch.object(module, "get_finalize_all_reduce", lambda: None)
         for module in (muse_model, muse_moe_runner)
     ]
+    assert block.unpooler is not None
+    hook = block.unpooler.register_forward_pre_hook(
+        lambda module, args: unpooler_inputs.append(args[0].clone())
+    )
+    unpooler = block.unpooler.weight.double().abs()
     for num_tokens in (1, 7, 64):
         torch.manual_seed(num_tokens)
         x = torch.randn(num_tokens, HIDDEN_SIZE)
         with (
             set_current_vllm_config(config),
             set_forward_context(None, config, num_tokens=num_tokens),
+            contextlib.ExitStack() as stack,
         ):
+            for p in patches:
+                stack.enter_context(p)
+            counts.update(all_reduce=0, fused=0)
             actual = block(x).clone()
+            assert counts["all_reduce"] + counts["fused"] == 1, counts
+            fused_reduced = counts["fused"] == 1
+            reduced_actual = unpooler_inputs[-1]
+            counts.update(all_reduce=0, fused=0)
             with no_fused[0], no_fused[1]:
                 expected = block(x).clone()
-        torch.testing.assert_close(actual, expected, atol=0.002, rtol=0.02)
+            assert counts == {"all_reduce": 1, "fused": 0}, counts
+            reduced_expected = unpooler_inputs[-1]
+        gathered = [torch.empty_like(partials[-1]) for _ in range(world)]
+        torch.distributed.all_gather(
+            gathered, partials[-1], group=get_tp_group().device_group
+        )
+        parts = torch.stack(gathered).double()
+        exact = parts.sum(0)
+        abs_sum = parts.abs().sum(0)
+        # fp32 sum of the unrounded partials (half an ulp from the gathered
+        # ones), rounded once; or a bf16 all-reduce, half an ulp per add.
+        slack = _bf16_ulp(exact) + 2.0**-18 * abs_sum
+        fused_bound = 0.5 * _bf16_ulp(parts).sum(0) + slack
+        unfused_bound = 0.5 * (world - 1) * _bf16_ulp(abs_sum) + slack
+        assert ((reduced_expected.double() - exact).abs() <= unfused_bound).all()
+        actual_bound = fused_bound if fused_reduced else unfused_bound
+        assert ((reduced_actual.double() - exact).abs() <= actual_bound).all()
+        # The same unpooler on both: the difference propagates linearly, plus
+        # the output rounding and the GEMM's fp32 accumulation.
+        out_bound = (
+            (actual_bound + unfused_bound) @ unpooler.t()
+            + _bf16_ulp(actual)
+            + _bf16_ulp(expected)
+            + 2.0**-16 * (reduced_actual.double().abs() @ unpooler.t())
+        )
+        assert ((actual.double() - expected.double()).abs() <= out_bound).all()
+    hook.remove()
 
 
 def _make_layers(config: VllmConfig, rank: int) -> nn.ModuleList:
