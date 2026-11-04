@@ -30,7 +30,6 @@ import os
 
 import torch
 import torch.distributed as dist
-from benchmark_muse_spark_rocm_column_gather import _time_graph
 
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import (
@@ -39,6 +38,7 @@ from vllm.distributed import (
     initialize_model_parallel,
     tensor_model_parallel_all_reduce,
 )
+from vllm.distributed.parallel_state import graph_capture
 from vllm.models.muse_spark.amd.ops.peer_sync import (
     PeerBuffer,
     grid_barrier,
@@ -108,6 +108,30 @@ def _barrier_kernel(
 @triton.jit
 def _empty_kernel(x_ptr):
     tl.store(x_ptr + tl.program_id(0), 0)
+
+
+def _time_graph(fn, calls: int, iters: int) -> float:
+    """Microseconds per call, from a graph of ``calls`` calls."""
+    for _ in range(3):
+        fn(0)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    with graph_capture(device) as ctx, torch.cuda.graph(graph, stream=ctx.stream):
+        for i in range(calls):
+            fn(i)
+    for _ in range(5):
+        graph.replay()
+    torch.accelerator.synchronize()
+    dist.barrier(group=get_tp_group().cpu_group)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        graph.replay()
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) * 1000 / (iters * calls)
 
 
 MODES = {"counter": 0, "counter-nowave": 1, "flags": 2}
