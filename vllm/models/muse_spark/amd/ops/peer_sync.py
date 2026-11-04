@@ -51,6 +51,23 @@ def peer(P, r, DTYPE: tl.constexpr):
 
 
 @triton.jit
+def _wait_stores(x):
+    """``s_waitcnt vmcnt(0)``: this wave's outstanding stores have completed
+    (GFX9 counts stores in vmcnt). Neither ``debug_barrier`` nor a
+    workgroup-scope release waits for them on CDNA (no tgsplit), so the
+    cross-rank flag could otherwise be published before the data lands. Side
+    effects plus a memory clobber keep the stores on the near side of it."""
+    return tl.inline_asm_elementwise(
+        "s_waitcnt vmcnt(0)\nv_mov_b32 $0, $1",
+        "=v,v,~{memory}",
+        [x],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
 def grid_barrier(
     P,
     rank,
@@ -62,20 +79,12 @@ def grid_barrier(
     NUM_WAVES: tl.constexpr,
 ):
     """Publish ``target`` on flag ``[rank][block]`` of every rank, then wait
-    until every flag of this rank has reached it."""
+    until every flag of this rank has reached it. ``wave_off`` is reserved."""
     b = tl.program_id(0)
     mine = peer(P, rank, tl.int32)
-    # One release per wave, at workgroup scope, on a word of its own: waits for
-    # this wave's outstanding stores (``debug_barrier`` does not, no
-    # ``s_waitcnt vmcnt(0)``) without the system-scope atomic per wave.
-    lanes = tl.arange(0, NUM_WAVES * 64)
-    tl.atomic_add(
-        mine + wave_off + b * NUM_WAVES + lanes // 64,
-        0,
-        mask=lanes % 64 == 0,
-        sem="release",
-        scope="cta",
-    )
+    # Every wave waits for its own stores, then the block synchronizes, then
+    # one lane publishes the flag with a system-scope release.
+    _wait_stores(tl.arange(0, NUM_WAVES * 64))
     tl.debug_barrier()
     for r in tl.static_range(W):
         tl.atomic_xchg(
