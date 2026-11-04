@@ -32,9 +32,11 @@ from .peer_sync import (
     NUM_BLOCKS,
     PeerBuffer,
     all_tp_ranks,
+    barrier_words,
     grid_barrier,
     peer,
     tp_group_supports_peer_kernels,
+    wave_words,
 )
 
 logger = init_logger(__name__)
@@ -100,7 +102,8 @@ def _gather_rmsnorm_kernel(
     eps,
     gain_center,
     buf_elems,
-    count_off,
+    flags_off,
+    wave_off,
     target_off,
     W: tl.constexpr,
     D: tl.constexpr,
@@ -116,7 +119,7 @@ def _gather_rmsnorm_kernel(
 ):
     target, buf_off = parity_buffer(P, rank, target_off, buf_elems, LOG2_ARRIVALS)
     push_columns(shard_ptr, stride_shard, P, rank, buf_off, T, W, D, NB, BLOCK_S, ROWS)
-    grid_barrier(P, rank, count_off, target, W, NUM_WAVES)
+    grid_barrier(P, rank, flags_off, wave_off, target, W, NB, NUM_WAVES)
 
     d = tl.arange(0, BLOCK_D)
     dm = d < D
@@ -160,7 +163,8 @@ def _gather_boundary_kernel(
     pre_gain_center,
     alpha_scalar,
     buf_elems,
-    count_off,
+    flags_off,
+    wave_off,
     target_off,
     W: tl.constexpr,
     D: tl.constexpr,
@@ -179,7 +183,7 @@ def _gather_boundary_kernel(
 ):
     target, buf_off = parity_buffer(P, rank, target_off, buf_elems, LOG2_ARRIVALS)
     push_columns(shard_ptr, stride_shard, P, rank, buf_off, T, W, D, NB, BLOCK_S, ROWS)
-    grid_barrier(P, rank, count_off, target, W, NUM_WAVES)
+    grid_barrier(P, rank, flags_off, wave_off, target, W, NB, NUM_WAVES)
 
     d = tl.arange(0, BLOCK_D)
     dm = d < D
@@ -233,11 +237,13 @@ class MuseSparkColumnGather:
         self.rank = dist.get_rank(group=group)
         self.buf_elems = max_tokens * max_hidden
         sync_off = 2 * self.buf_elems * 2
-        self.count_off = sync_off // 4
-        self.target_off = self.count_off + 1
+        self.flags_off = sync_off // 4
+        self.wave_off = self.flags_off + barrier_words(self.world_size)
+        self.target_off = self.wave_off + wave_words()
         self.log2_arrivals = (self.world_size * NUM_BLOCKS).bit_length() - 1
         assert 1 << self.log2_arrivals == self.world_size * NUM_BLOCKS
-        self.buffer = PeerBuffer(sync_off + (1 + NUM_BLOCKS) * 4, group)
+        sync_words = self.target_off - self.flags_off + NUM_BLOCKS
+        self.buffer = PeerBuffer(sync_off + sync_words * 4, group)
 
     def supports(self, num_tokens: int, hidden: int, dtype: torch.dtype) -> bool:
         """Whether ``[num_tokens, hidden / W]`` blocks can be gathered."""
@@ -274,7 +280,8 @@ class MuseSparkColumnGather:
             norm.variance_epsilon,
             norm.fused_gain_center,
             self.buf_elems,
-            self.count_off,
+            self.flags_off,
+            self.wave_off,
             self.target_off,
             W=self.world_size,
             D=hidden,
@@ -363,7 +370,8 @@ class MuseSparkColumnGather:
             pre_norm.fused_gain_center,
             1.0 if gate_stream else float(alpha),
             self.buf_elems,
-            self.count_off,
+            self.flags_off,
+            self.wave_off,
             self.target_off,
             W=self.world_size,
             D=hidden,

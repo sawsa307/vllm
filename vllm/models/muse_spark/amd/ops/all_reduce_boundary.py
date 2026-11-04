@@ -44,9 +44,11 @@ from .peer_sync import (
     NUM_BLOCKS,
     PeerBuffer,
     all_tp_ranks,
+    barrier_words,
     grid_barrier,
     peer,
     tp_group_supports_peer_kernels,
+    wave_words,
 )
 
 logger = init_logger(__name__)
@@ -138,9 +140,10 @@ def _all_reduce_boundary_kernel(
     one_shot_elems,
     slots_off,
     gathered_off,
-    count1_off,
-    count2a_off,
-    count2b_off,
+    flags1_off,
+    flags2a_off,
+    flags2b_off,
+    wave_off,
     target1_off,
     target2_off,
     W: tl.constexpr,
@@ -176,7 +179,7 @@ def _all_reduce_boundary_kernel(
                 if t < T:
                     x = tl.load(partial_ptr + t * stride_partial + d, mask=dm)
                     tl.store(dst + g * D + d, x, mask=dm)
-        grid_barrier(P, rank, count2a_off, target, W, NUM_WAVES)
+        grid_barrier(P, rank, flags2a_off, wave_off, target, W, NB, NUM_WAVES)
         # B: sum this rank's rows in rank order, round once, push to every rank.
         for g in range(b, groups, NB):
             t = g * W + rank
@@ -189,7 +192,7 @@ def _all_reduce_boundary_kernel(
                 for r in tl.static_range(W):
                     dst = peer(P, r, tl.bfloat16) + gathered_off + t * D
                     tl.store(dst + d, res, mask=dm)
-        grid_barrier(P, rank, count2b_off, target, W, NUM_WAVES)
+        grid_barrier(P, rank, flags2b_off, wave_off, target, W, NB, NUM_WAVES)
         # C: the boundary of every reduced row.
         for t in range(b, T, NB):
             row = mine + gathered_off + t * D
@@ -212,7 +215,7 @@ def _all_reduce_boundary_kernel(
             for r in tl.static_range(W):
                 dst = peer(P, r, tl.bfloat16) + buf_off + (rank * MAX_T1 + t) * D
                 tl.store(dst + d, x, mask=dm)
-        grid_barrier(P, rank, count1_off, target, W, NUM_WAVES)
+        grid_barrier(P, rank, flags1_off, wave_off, target, W, NB, NUM_WAVES)
         # B: sum the partials in rank order, round once, run the boundary.
         for t in range(b, T, NB):
             x = tl.zeros([BLOCK_D], dtype=tl.float32)
@@ -257,14 +260,17 @@ class MuseSparkAllReduceBoundary:
         self.slots_off = 2 * self.one_shot_elems
         self.gathered_off = self.slots_off + world * self.slots_per_rank * hidden
         sync_off = (self.gathered_off + max_tokens * hidden) * 2
-        self.count1_off = sync_off // 4
-        self.count2a_off = self.count1_off + 1
-        self.count2b_off = self.count1_off + 2
-        self.target1_off = self.count1_off + 3
+        self.flags1_off = sync_off // 4
+        self.flags2a_off = self.flags1_off + barrier_words(world)
+        self.flags2b_off = self.flags2a_off + barrier_words(world)
+        self.wave_off = self.flags2b_off + barrier_words(world)
+        self.target1_off = self.wave_off + wave_words()
         self.target2_off = self.target1_off + NUM_BLOCKS
         self.log2_arrivals = (world * NUM_BLOCKS).bit_length() - 1
         assert 1 << self.log2_arrivals == world * NUM_BLOCKS
-        self.buffer = PeerBuffer(sync_off + (3 + 2 * NUM_BLOCKS) * 4, group)
+        self.buffer = PeerBuffer(
+            sync_off + (self.target2_off - self.flags1_off + NUM_BLOCKS) * 4, group
+        )
 
     def supports(
         self,
@@ -348,9 +354,10 @@ class MuseSparkAllReduceBoundary:
             self.one_shot_elems,
             self.slots_off,
             self.gathered_off,
-            self.count1_off,
-            self.count2a_off,
-            self.count2b_off,
+            self.flags1_off,
+            self.flags2a_off,
+            self.flags2b_off,
+            self.wave_off,
             self.target1_off,
             self.target2_off,
             W=self.world_size,

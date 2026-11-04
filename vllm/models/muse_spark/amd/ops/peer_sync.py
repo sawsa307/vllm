@@ -4,10 +4,14 @@
 
 Every rank of the TP group allocates one uncached buffer and maps every peer's.
 A kernel addresses rank ``r``'s buffer through :func:`peer` and separates its
-phases with :func:`grid_barrier`: every block of every rank arrives on every
-rank's counter, then waits until its own counter reaches a cumulative target.
-The barrier needs the whole grid resident, so kernels launch a fixed, small
-grid of ``NUM_BLOCKS``.
+phases with :func:`grid_barrier`: block ``b`` of rank ``s`` writes the call's
+target into flag ``[s][b]`` of every rank, then waits until all ``W * NB``
+flags of its own rank carry it. One writer per flag and vector polls keep the
+barrier free of contended atomics (on MI355X the earlier shared counter with a
+system-scope release per wave cost 28 us, against 4 us for a custom
+all-reduce). The barrier needs the whole grid resident, so kernels launch a
+fixed, small grid of ``NUM_BLOCKS``; a workspace reserves
+:func:`barrier_words` int32 words per barrier and :func:`wave_words` once.
 """
 
 import torch
@@ -20,6 +24,17 @@ from vllm.triton_utils import tl, triton
 
 MAX_WORLD_SIZE = 8
 NUM_BLOCKS = 64
+MAX_WAVES = 16
+
+
+def barrier_words(world_size: int) -> int:
+    """int32 words one barrier's flags take: ``[world_size][NUM_BLOCKS]``."""
+    return world_size * NUM_BLOCKS
+
+
+def wave_words() -> int:
+    """int32 words of the per-(block, wave) release scratch a workspace holds."""
+    return NUM_BLOCKS * MAX_WAVES
 
 
 @triton.jit
@@ -36,20 +51,47 @@ def peer(P, r, DTYPE: tl.constexpr):
 
 
 @triton.jit
-def grid_barrier(P, rank, count_off, target, W: tl.constexpr, NUM_WAVES: tl.constexpr):
-    """Arrive on every rank's counter, then wait for ``target`` arrivals."""
-    mine = peer(P, rank, tl.int32) + count_off
-    # A release by one lane of every wave: ``debug_barrier`` does not wait for
-    # the other waves' outstanding stores (no ``s_waitcnt vmcnt(0)``).
+def grid_barrier(
+    P,
+    rank,
+    flags_off,
+    wave_off,
+    target,
+    W: tl.constexpr,
+    NB: tl.constexpr,
+    NUM_WAVES: tl.constexpr,
+):
+    """Publish ``target`` on flag ``[rank][block]`` of every rank, then wait
+    until every flag of this rank has reached it."""
+    b = tl.program_id(0)
+    mine = peer(P, rank, tl.int32)
+    # One release per wave, at workgroup scope, on a word of its own: waits for
+    # this wave's outstanding stores (``debug_barrier`` does not, no
+    # ``s_waitcnt vmcnt(0)``) without the system-scope atomic per wave.
     lanes = tl.arange(0, NUM_WAVES * 64)
-    tl.atomic_add(mine + lanes * 0, 0, mask=lanes % 64 == 0, sem="release", scope="sys")
+    tl.atomic_add(
+        mine + wave_off + b * NUM_WAVES + lanes // 64,
+        0,
+        mask=lanes % 64 == 0,
+        sem="release",
+        scope="cta",
+    )
     tl.debug_barrier()
     for r in tl.static_range(W):
-        tl.atomic_add(peer(P, r, tl.int32) + count_off, 1, sem="release", scope="sys")
-    seen = tl.atomic_add(mine, 0, sem="acquire", scope="sys")
-    # Wrapping difference: the counters overflow after ~2^31 arrivals.
-    while seen - target < 0:
-        seen = tl.atomic_add(mine, 0, sem="acquire", scope="sys")
+        tl.atomic_xchg(
+            peer(P, r, tl.int32) + flags_off + rank * NB + b,
+            target,
+            sem="release",
+            scope="sys",
+        )
+    flags = mine + flags_off + tl.arange(0, W * NB)
+    # Wrapping difference: the targets overflow after ~2^31 arrivals.
+    seen = tl.load(flags, volatile=True)
+    while tl.min(seen - target, axis=0) < 0:
+        seen = tl.load(flags, volatile=True)
+    # Acquire after the successful poll, so the data reads that follow are not
+    # reordered before it.
+    tl.atomic_add(mine + flags_off + rank * NB + b, 0, sem="acquire", scope="sys")
     tl.debug_barrier()
 
 

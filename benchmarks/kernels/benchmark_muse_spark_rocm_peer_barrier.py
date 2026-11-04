@@ -11,7 +11,10 @@ wave before, an acquire poll after). On MI355X TP4 the gather kernels cost
 synchronization is the suspect. This times, as graph replays of ``--calls``
 back-to-back launches, a kernel that does nothing but the barrier:
 
-* ``counter``: ``grid_barrier`` as the kernels use it;
+* ``grid_barrier``: the barrier as the kernels now use it (per-block flags,
+  vector polls, one workgroup-scope release per wave);
+* ``counter``: the previous barrier (one counter per rank, every block of every
+  rank arrives on it, a system-scope release per wave);
 * ``counter-nowave``: the same without the per-wave release (one release per
   block, by the arrival atomic) - the L2 writeback cost;
 * ``flags``: one flag per (writer rank, block) on every rank, each block waits
@@ -54,6 +57,22 @@ from vllm.models.muse_spark.amd.ops.peer_sync import (
 )
 from vllm.triton_utils import tl, triton
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+
+@triton.jit
+def _barrier_counter(
+    P, rank, count_off, target, W: tl.constexpr, NUM_WAVES: tl.constexpr
+):
+    mine = peer(P, rank, tl.int32) + count_off
+    lanes = tl.arange(0, NUM_WAVES * 64)
+    tl.atomic_add(mine + lanes * 0, 0, mask=lanes % 64 == 0, sem="release", scope="sys")
+    tl.debug_barrier()
+    for r in tl.static_range(W):
+        tl.atomic_add(peer(P, r, tl.int32) + count_off, 1, sem="release", scope="sys")
+    seen = tl.atomic_add(mine, 0, sem="acquire", scope="sys")
+    while seen - target < 0:
+        seen = tl.atomic_add(mine, 0, sem="acquire", scope="sys")
+    tl.debug_barrier()
 
 
 @triton.jit
@@ -150,7 +169,9 @@ def _barrier_kernel(
     b = tl.program_id(0)
     target = tl.load(peer(P, rank, tl.int32) + target_off + b) + W * NB
     if MODE == 0:
-        grid_barrier(P, rank, count_off, target, W, NUM_WAVES)
+        _barrier_counter(P, rank, count_off, target, W, NUM_WAVES)
+    elif MODE == 7:
+        grid_barrier(P, rank, flags_off, wave_off, target, W, NB, NUM_WAVES)
     elif MODE == 1:
         _barrier_no_wave_release(P, rank, count_off, target, W, NUM_WAVES)
     else:
@@ -206,6 +227,7 @@ MODES = {
     "flags-wave-gpu": 4,
     "flags-wave-cta": 5,
     "flags-wave-cached": 6,
+    "grid_barrier": 7,
 }
 
 
