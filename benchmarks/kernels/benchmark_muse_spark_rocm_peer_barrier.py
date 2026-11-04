@@ -17,9 +17,13 @@ back-to-back launches, a kernel that does nothing but the barrier:
 * ``flags``: one flag per (writer rank, block) on every rank, each block waits
   on its own W flags (AITER's custom all-reduce pattern), no per-wave release -
   the contention cost;
-* ``flags-wave-sys`` / ``flags-wave-gpu``: ``flags`` plus a per-wave release on a
-  distinct local address per (block, wave) at system / device scope - the two
-  candidate replacements, which keep every wave's stores ordered before the flag;
+* ``flags-wave-sys`` / ``flags-wave-gpu`` / ``flags-wave-cta``: ``flags`` plus a
+  per-wave release on a distinct word per (block, wave) in the uncached peer
+  buffer, at system / device / workgroup scope;
+* ``flags-wave-cached``: the per-wave release at workgroup scope on a word of
+  ordinary (cached) device memory instead - a plain ``s_waitcnt vmcnt(0)`` plus
+  one L2 atomic, the cheapest form that still orders every wave's stores
+  before the flag write;
 
 over a sweep of block counts and waves per block, against an empty launch of
 the same grid and a custom all-reduce of a [1, 8192] bf16 tensor.
@@ -83,11 +87,20 @@ def _wave_release_gpu(ptr, NUM_WAVES: tl.constexpr):
 
 
 @triton.jit
+def _wave_release_cta(ptr, NUM_WAVES: tl.constexpr):
+    lanes = tl.arange(0, NUM_WAVES * 64)
+    tl.atomic_add(
+        ptr + lanes // 64, 0, mask=lanes % 64 == 0, sem="release", scope="cta"
+    )
+
+
+@triton.jit
 def _barrier_flags(
     P,
     rank,
     flags_off,
     wave_off,
+    scratch_ptr,
     target,
     W: tl.constexpr,
     NB: tl.constexpr,
@@ -100,6 +113,10 @@ def _barrier_flags(
         _wave_release_sys(peer(P, rank, tl.int32) + wave_off + b * NUM_WAVES, NUM_WAVES)
     elif WAVE_RELEASE == 2:
         _wave_release_gpu(peer(P, rank, tl.int32) + wave_off + b * NUM_WAVES, NUM_WAVES)
+    elif WAVE_RELEASE == 3:
+        _wave_release_cta(peer(P, rank, tl.int32) + wave_off + b * NUM_WAVES, NUM_WAVES)
+    elif WAVE_RELEASE == 4:
+        _wave_release_cta(scratch_ptr + b * NUM_WAVES, NUM_WAVES)
     tl.debug_barrier()
     for r in tl.static_range(W):
         tl.atomic_xchg(
@@ -124,6 +141,7 @@ def _barrier_kernel(
     target_off,
     flags_off,
     wave_off,
+    scratch_ptr,
     W: tl.constexpr,
     NB: tl.constexpr,
     NUM_WAVES: tl.constexpr,
@@ -136,7 +154,18 @@ def _barrier_kernel(
     elif MODE == 1:
         _barrier_no_wave_release(P, rank, count_off, target, W, NUM_WAVES)
     else:
-        _barrier_flags(P, rank, flags_off, wave_off, target, W, NB, NUM_WAVES, MODE - 2)
+        _barrier_flags(
+            P,
+            rank,
+            flags_off,
+            wave_off,
+            scratch_ptr,
+            target,
+            W,
+            NB,
+            NUM_WAVES,
+            MODE - 2,
+        )
     tl.store(peer(P, rank, tl.int32) + target_off + b, target)
 
 
@@ -175,6 +204,8 @@ MODES = {
     "flags": 2,
     "flags-wave-sys": 3,
     "flags-wave-gpu": 4,
+    "flags-wave-cta": 5,
+    "flags-wave-cached": 6,
 }
 
 
@@ -206,7 +237,7 @@ def main() -> None:
     stride = 1 + max_blocks + 8 * max_blocks + max_blocks * max_waves
     buffer = PeerBuffer(len(configs) * stride * 4, tp.cpu_group)
     P = buffer.peers
-    scratch = torch.zeros(max_blocks, dtype=torch.int32, device=device)
+    scratch = torch.zeros(max_blocks * max_waves, dtype=torch.int32, device=device)
     x = torch.randn(1, 8192, device=device).bfloat16()
 
     def barrier(index, mode, blocks, waves):
@@ -220,6 +251,7 @@ def main() -> None:
                 base + 1,
                 base + 1 + max_blocks,
                 base + 1 + max_blocks + 8 * max_blocks,
+                scratch,
                 W=world_size,
                 NB=blocks,
                 NUM_WAVES=waves,
