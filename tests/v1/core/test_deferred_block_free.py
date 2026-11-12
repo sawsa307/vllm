@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, PropertyMock, patch
 import pytest
 
 from vllm.config import VllmConfig
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.metrics.stats import PrefixCacheStats
@@ -647,3 +648,92 @@ def test_abort_deferred_async_load_frees_after_inflight_step():
         scheduler.update_from_output(output, _make_model_runner_output(output))
     assert not scheduler.deferred_frees
     assert pool.get_num_free_blocks() > num_free_held
+
+
+def _create_loading_scheduler():
+    """Async scheduler whose connector loads 32 tokens of requests named
+    ``load*`` asynchronously. Deferred block freeing stays off, as without a
+    consumer connector, so only the KV load's own fence protects the blocks.
+    """
+    scheduler = create_scheduler(
+        model=MODEL,
+        async_scheduling=True,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
+    )
+    assert not scheduler.defer_block_free
+    connector = scheduler.connector
+    connector.get_num_new_matched_tokens = lambda request, _: (
+        (32, True) if request.request_id.startswith("load") else (0, False)
+    )
+    connector.update_state_after_alloc = MagicMock()
+    return scheduler
+
+
+def _loads(connector) -> list:
+    """The requests whose external tokens the connector was told to load."""
+    return [
+        call.args[0]
+        for call in connector.update_state_after_alloc.call_args_list
+        if call.args[2] > 0
+    ]
+
+
+def _add_loading_request(scheduler):
+    request = create_requests(
+        num_requests=1, num_tokens=48, req_ids=["load"], max_tokens=2
+    )[0]
+    scheduler.add_request(request)
+    return request
+
+
+def test_load_into_blocks_of_inflight_step_waits_for_it():
+    """A KV load is not ordered with the GPU steps: when it gets the blocks of
+    a request freed while that request's last step is in flight, it starts
+    only after that step's output is processed."""
+    scheduler = _create_loading_scheduler()
+    connector = scheduler.connector
+    request, out0, out1 = _setup_request_with_inflight_step(scheduler)
+    (freed_ids,) = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    scheduler.update_from_output(
+        out0, _make_model_runner_output(out0, token_id=STOP_TOKEN_ID)
+    )
+    assert request.is_finished()
+
+    loading = _add_loading_request(scheduler)
+    scheduler.schedule()
+    (load_ids,) = scheduler.kv_cache_manager.get_block_ids(loading.request_id)
+    assert set(load_ids) & set(freed_ids)
+    assert _loads(connector) == []
+
+    scheduler.update_from_output(out1, _make_model_runner_output(out1))
+    assert _loads(connector) == [loading]
+
+
+def test_load_into_blocks_of_processed_steps_starts_at_once():
+    """Blocks whose last accessing step is processed are loaded right away."""
+    scheduler = _create_loading_scheduler()
+    connector = scheduler.connector
+    request, out0, out1 = _setup_request_with_inflight_step(scheduler)
+    scheduler.update_from_output(
+        out0, _make_model_runner_output(out0, token_id=STOP_TOKEN_ID)
+    )
+    scheduler.update_from_output(out1, _make_model_runner_output(out1))
+
+    loading = _add_loading_request(scheduler)
+    scheduler.schedule()
+
+    assert _loads(connector) == [loading]
+
+
+def test_unpinned_block_is_fenced_by_the_step_scheduled_at_reuse():
+    """An unpinned block (HiSparse) is read by its owner until the pool hands
+    it out again, so a KV load into it must wait for the steps scheduled up to
+    that reuse, not those up to the unpin."""
+    pool = BlockPool(num_gpu_blocks=2, enable_caching=False, hash_block_size=16)
+    (block,) = pool.get_new_blocks(1)
+    pool.release_fence = 3
+    pool.unpin_blocks([block], on_reuse=lambda _: None)
+    pool.release_fence = 5
+
+    assert pool.get_new_blocks(1) == [block]
+    assert block.access_fence == 5

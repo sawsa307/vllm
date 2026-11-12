@@ -187,6 +187,10 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # The last scheduled step that may access the block's memory, as
+    # ``BlockPool.release_fence`` at its releases.
+    access_fence: int = 0
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash

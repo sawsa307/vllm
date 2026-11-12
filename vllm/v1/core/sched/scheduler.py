@@ -1464,15 +1464,30 @@ class Scheduler(SchedulerInterface):
                 # This information is used to determine if a load is
                 # needed for this request.
                 if self.connector is not None:
-                    defer_load = (
+                    load_fence = self._load_fence(
+                        request_id,
+                        num_new_local_computed_tokens,
+                        num_external_computed_tokens,
+                    )
+                    if (
                         load_kv_async
                         and self.defer_async_loads
                         and self.sched_step_seq > self.processed_step_seq
+                    ):
+                        load_fence = self.sched_step_seq
+                    elif load_fence > self.processed_step_seq:
+                        logger.warning_once(
+                            "A KV load was handed blocks that an in-flight step "
+                            "may still access%s.",
+                            "; deferring it" if load_kv_async else "",
+                        )
+                    defer_load = load_kv_async and (
+                        load_fence > self.processed_step_seq
                     )
                     if defer_load:
                         request.last_sched_seq = self.sched_step_seq
                         self.deferred_loads[request_id] = (
-                            self.sched_step_seq,
+                            load_fence,
                             num_external_computed_tokens,
                             connector_prefix_cache_queries,
                             connector_prefix_cache_hits,
@@ -1775,8 +1790,9 @@ class Scheduler(SchedulerInterface):
 
         # Advance the fence only for non-empty steps (those that actually
         # write KV and have their output processed later in update_from_output).
-        if self.defer_block_free and total_num_scheduled_tokens > 0:
+        if total_num_scheduled_tokens > 0:
             self.sched_step_seq += 1
+            self.kv_cache_manager.block_pool.release_fence = self.sched_step_seq
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
@@ -1856,9 +1872,8 @@ class Scheduler(SchedulerInterface):
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
             request.num_in_flight_tokens += num_scheduled_token
-            if self.defer_block_free:
-                # Record the in-flight step, to fence deferred block freeing.
-                request.last_sched_seq = self.sched_step_seq
+            # The last step that may access the request's blocks.
+            request.last_sched_seq = self.sched_step_seq
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )
@@ -2272,10 +2287,12 @@ class Scheduler(SchedulerInterface):
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
-        if self.defer_block_free and scheduler_output.total_num_scheduled_tokens > 0:
+        if scheduler_output.total_num_scheduled_tokens > 0:
             self.processed_step_seq += 1
-            self._drain_deferred_frees()
-            self._drain_deferred_loads()
+            if self.defer_block_free:
+                self._drain_deferred_frees()
+            if self.deferred_loads:
+                self._drain_deferred_loads()
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -3090,7 +3107,10 @@ class Scheduler(SchedulerInterface):
         pool when an in-flight GPU step may still write them.
         """
         if self._request_blocks_can_be_freed(request):
-            self.kv_cache_manager.free(request)
+            with self.kv_cache_manager.block_pool.releasing_after(
+                request.last_sched_seq
+            ):
+                self.kv_cache_manager.free(request)
             return
         blocks = self.kv_cache_manager.pop_blocks_for_free(request)
         if blocks:
@@ -3103,7 +3123,9 @@ class Scheduler(SchedulerInterface):
         pool while the step that runs the copy may still be in flight.
         """
         if not self.defer_block_free or fence_seq <= self.processed_step_seq:
-            self.kv_cache_manager.block_pool.free_blocks(blocks)
+            block_pool = self.kv_cache_manager.block_pool
+            with block_pool.releasing_after(fence_seq):
+                block_pool.free_blocks(blocks)
             return
         self.deferred_frees.append((fence_seq, blocks[::-1]))
 
@@ -3119,8 +3141,30 @@ class Scheduler(SchedulerInterface):
             if fence > self.processed_step_seq:
                 break
             _, blocks = self.deferred_frees.popleft()
+            block_pool = self.kv_cache_manager.block_pool
             # Free in reverse order so that the tail blocks are evicted first.
-            self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
+            with block_pool.releasing_after(fence):
+                block_pool.free_blocks(reversed(blocks))
+
+    def _load_fence(
+        self, request_id: str, num_local_tokens: int, num_external_tokens: int
+    ) -> int:
+        """The last scheduled step that may access the blocks a KV load of a
+        request's external tokens writes. The load must not start before that
+        step has finished: it is not ordered with the GPU steps.
+        """
+        if num_external_tokens == 0:
+            return 0
+        fence = 0
+        num_tokens = num_local_tokens + num_external_tokens
+        blocks = self.kv_cache_manager.get_blocks(request_id).blocks
+        for group, group_blocks in zip(self.kv_cache_config.kv_cache_groups, blocks):
+            block_size = group.kv_cache_spec.block_size
+            for block in group_blocks[
+                num_local_tokens // block_size : cdiv(num_tokens, block_size)
+            ]:
+                fence = max(fence, block.access_fence)
+        return fence
 
     def _drain_deferred_loads(self) -> None:
         """Start deferred async loads whose fence step has completed."""
@@ -3128,7 +3172,7 @@ class Scheduler(SchedulerInterface):
             self.deferred_loads.items()
         ):
             if fence > self.processed_step_seq:
-                break
+                continue
             del self.deferred_loads[request_id]
             assert self.connector is not None
             request = self.requests[request_id]

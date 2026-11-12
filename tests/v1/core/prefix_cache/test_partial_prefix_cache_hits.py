@@ -1811,12 +1811,15 @@ def test_free_cow_retained_blocks_defers_until_copy_step_processed():
     """Scheduler releases CoW retentions immediately when the copy's step has
     been processed (or deferral is off), and defers them otherwise."""
     from collections import deque
+    from contextlib import nullcontext
 
     freed: list = []
     blocks = [SimpleNamespace(block_id=7), SimpleNamespace(block_id=9)]
     mock = SimpleNamespace(
         kv_cache_manager=SimpleNamespace(
-            block_pool=SimpleNamespace(free_blocks=freed.extend)
+            block_pool=SimpleNamespace(
+                free_blocks=freed.extend, releasing_after=lambda _: nullcontext()
+            )
         ),
         deferred_frees=deque(),
         defer_block_free=True,
