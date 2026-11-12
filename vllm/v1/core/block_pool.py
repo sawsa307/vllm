@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -198,6 +199,11 @@ class BlockPool:
         # Callbacks for blocks released with ``unpin_blocks`` whose contents
         # are still being read until the pool reuses them.
         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
+
+        # The last scheduled step that may still access a block released now;
+        # each release raises the block's ``access_fence`` to it. Steps are
+        # numbered by the scheduler (``Scheduler.sched_step_seq``).
+        self.release_fence = 0
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -745,7 +751,19 @@ class BlockPool:
         for block in blocks:
             watcher = self._reuse_watchers.pop(block.block_id, None)
             if watcher is not None:
+                # Read by every step scheduled until now.
+                block.access_fence = max(block.access_fence, self.release_fence)
                 watcher(block)
+
+    @contextmanager
+    def releasing_after(self, step: int) -> Iterator[None]:
+        """Release blocks with ``step`` as their last accessing step, e.g.
+        that of the request whose blocks they are."""
+        release_fence, self.release_fence = self.release_fence, step
+        try:
+            yield
+        finally:
+            self.release_fence = release_fence
 
     def unpin_blocks(
         self,
@@ -835,6 +853,8 @@ class BlockPool:
                 other_pools.setdefault(block.pool, []).append(block)
                 continue
             block.ref_cnt -= 1
+            if block.access_fence < self.release_fence:
+                block.access_fence = self.release_fence
             if block.ref_cnt == 0:
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
