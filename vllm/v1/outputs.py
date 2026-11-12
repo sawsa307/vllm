@@ -23,12 +23,14 @@ if TYPE_CHECKING:
         KVConnectorWorkerMetadata,
     )
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+    from vllm.v1.core.kv_read_check import KVReadChecksums
 else:
     AuxRequestOutput = object
     KVConnectorStats = object
     KVConnectorWorkerMetadata = object
     KVConnectorKVEvents = object
     ECConnectorWorkerMetadata = object
+    KVReadChecksums = object
 
 
 class LogprobsLists(NamedTuple):
@@ -309,6 +311,9 @@ class ModelRunnerOutput:
 
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
+
+    # Checksums of the step's kv_read_check_plan, if any.
+    kv_read_checksums: KVReadChecksums | None = None
 
     @staticmethod
     def with_kv_conn_output_only(

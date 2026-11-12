@@ -376,6 +376,14 @@ class CacheConfig:
     eager prefill steps on each request's trailing window only. Requires model
     runner V2."""
 
+    kv_read_check_interval: int = Field(default=0, ge=0)
+    """Debug check for KV cache corruption: every this many steps, checksum
+    the KV cache blocks each scheduled request reads after the forward and
+    compare them with their checksums from when their KV was final. A request
+    whose KV differs fails with a retryable error. 0 disables the check.
+    Checking every step can nearly double decode step time. Requires model
+    runner V2."""
+
     kv_cache_memory_bytes: int | None = None
     """Size of KV Cache per GPU in bytes. By default, this is set to None
     and vllm can automatically infer the kv cache size based on
