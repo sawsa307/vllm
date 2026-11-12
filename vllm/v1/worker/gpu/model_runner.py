@@ -37,16 +37,27 @@ from vllm.compilation.breakable_cudagraph import (
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
 from vllm.compilation.wrapper import compile_model_with_stock_torch
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import (
+    VllmConfig,
+    get_layers_from_vllm_config,
+    set_current_vllm_config,
+)
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.device_allocator import get_mem_allocator_instance
 from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
     get_aux_output_connector,
 )
-from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
+from vllm.distributed.parallel_state import (
+    get_dcp_group,
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
@@ -139,6 +150,7 @@ from vllm.v1.worker.gpu.kv_connector import (
     KVConnector,
     get_kv_connector,
 )
+from vllm.v1.worker.gpu.kv_read_check import KVReadChecksummer
 from vllm.v1.worker.gpu.lora_utils import (
     LoraState,
     create_lora_capture_hook,
@@ -360,6 +372,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # KV Connector if configured.
         self.kv_connector: KVConnector = NO_OP_KV_CONNECTOR
+        self.kv_read_checksummer: KVReadChecksummer | None = None
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
@@ -856,6 +869,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
             self.kv_caches_by_layer = kv_caches_dict
+            if self.cache_config.kv_read_check_interval:
+                self.kv_read_checksummer = self._create_kv_read_checksummer(
+                    kv_caches_dict
+                )
             self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
             # AuxOutput connector requires resolved kv_cache_config.
@@ -865,6 +882,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.model, self.vllm_config
                     )
                 self.aux_output_connector.initialize_output_storage(kv_cache_config)
+
+    def _create_kv_read_checksummer(
+        self, kv_caches: dict[str, torch.Tensor]
+    ) -> KVReadChecksummer:
+        layers = get_layers_from_vllm_config(
+            self.vllm_config,
+            AttentionLayerBase,  # type: ignore[type-abstract]
+        )
+        tp_size = get_tensor_model_parallel_world_size()
+        return KVReadChecksummer(
+            self.kv_cache_config,
+            kv_caches,
+            draft_layer_names=frozenset(
+                name for name, layer in layers.items() if layer.is_draft_layer
+            ),
+            tp_rank=get_tensor_model_parallel_rank(),
+            tp_group=get_tp_group().device_group if tp_size > 1 else None,
+        )
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
@@ -2156,6 +2191,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.kv_connector.finish_forward()
 
+        kv_read_checksums = None
+        plan = scheduler_output.kv_read_check_plan
+        if plan is not None and self.kv_read_checksummer is not None:
+            kv_read_checksums = (plan.step_id, self.kv_read_checksummer.compute(plan))
+
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
                 assert isinstance(model_output, tuple)
@@ -2191,6 +2231,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_spec_tokens_to_schedule=(
                 0 if skip_drafts else scheduler_output.num_spec_tokens_to_schedule
             ),
+            kv_read_checksums=kv_read_checksums,
         )
 
         if not self.is_last_pp_rank:
@@ -2221,6 +2262,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ec_connector_output = self.execute_model_state.ec_connector_output
         cudagraph_stats = self.execute_model_state.cudagraph_stats
         num_spec_tokens = self.execute_model_state.num_spec_tokens_to_schedule
+        kv_read_checksums = self.execute_model_state.kv_read_checksums
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -2310,6 +2352,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             copy_stream=self.output_copy_stream,
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,
+            kv_read_checksums=kv_read_checksums,
         )
 
         # Collect KV transfer results now; finalize saves after the drafter runs.
@@ -2478,6 +2521,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_caches.clear()
         if hasattr(self, "kv_caches_by_layer"):
             self.kv_caches_by_layer.clear()
+        self.kv_read_checksummer = None
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):
@@ -2548,6 +2592,8 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     num_spec_tokens_to_schedule: int
+    # (step id, device checksums) of the step's kv_read_check_plan.
+    kv_read_checksums: tuple[int, torch.Tensor] | None = None
 
 
 class BatchReqState(NamedTuple):

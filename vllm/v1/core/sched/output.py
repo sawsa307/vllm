@@ -24,12 +24,14 @@ if TYPE_CHECKING:
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+    from vllm.v1.core.kv_read_check import KVReadCheckPlan
     from vllm.v1.request import Request
 else:
     AuxOutputConnectorMetadata = object
     ECConnectorMetadata = object
     KVConnectorMetadata = object
     KVCacheBlockCopy = object
+    KVReadCheckPlan = object
     LoRARequest = object
     MultiModalFeatureSpec = object
     PoolingParams = object
@@ -307,6 +309,9 @@ class SchedulerOutput:
 
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
+
+    # KV cache blocks to checksum after the forward (kv_read_check_interval).
+    kv_read_check_plan: KVReadCheckPlan | None = None
 
     # Scheduler-local; always None by the time this reaches a worker.
     kv_connector_block_state: KVConnectorBlockState | None = None

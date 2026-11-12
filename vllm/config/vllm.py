@@ -2150,6 +2150,7 @@ class VllmConfig:
         self._validate_profiler_config()
         self._validate_batch_sharded_sampling()
         self._validate_adaptive_verification()
+        self._validate_kv_read_check()
 
         # Re-compute compile ranges after platform-specific config updates
         # (e.g., XPU may lower max_num_batched_tokens when MLA is enabled)
@@ -3355,6 +3356,35 @@ class VllmConfig:
             raise ValueError(
                 "Adaptive verification is not currently compatible "
                 "with pipeline parallelism"
+            )
+
+    def _validate_kv_read_check(self) -> None:
+        """Validate `cache_config.kv_read_check_interval`."""
+        if not self.cache_config.kv_read_check_interval:
+            return
+        unsupported = []
+        if not self.use_v2_model_runner:
+            unsupported.append("model runner V1")
+        if (
+            self.model_config is not None
+            and self.model_config.runner_type != "generate"
+        ):
+            unsupported.append("pooling models")
+        if self.parallel_config.pipeline_parallel_size > 1:
+            unsupported.append("pipeline parallelism")
+        if (
+            self.parallel_config.decode_context_parallel_size > 1
+            or self.parallel_config.prefill_context_parallel_size > 1
+        ):
+            unsupported.append("context parallelism")
+        if self.attention_config.hisparse_config is not None:
+            # Residency, not the block table, says which pages a request reads.
+            unsupported.append("HiSparse")
+        if unsupported:
+            raise ValueError(
+                "KV cache read checks (kv_read_check_interval) do not support "
+                + ", ".join(unsupported)
+                + "."
             )
 
     def _validate_batch_sharded_sampling(self) -> None:

@@ -40,6 +40,7 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_read_check import KVReadChecker
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -200,6 +201,10 @@ class Scheduler(SchedulerInterface):
             )
 
             self.requires_kv_delivery = self.connector.requires_kv_delivery
+
+        self.kv_read_check = KVReadChecker.create(
+            self.kv_cache_config, self.cache_config.kv_read_check_interval
+        )
 
         self.kv_event_publisher = EventPublisherFactory.create(
             self.kv_events_config,
@@ -1869,6 +1874,12 @@ class Scheduler(SchedulerInterface):
             if not request.is_prefill_chunk:
                 self._inflight_prefills.discard(request)
 
+        if self.kv_read_check is not None and num_scheduled_tokens:
+            scheduler_output.kv_read_check_plan = self.kv_read_check.schedule(
+                (self.requests[req_id] for req_id in num_scheduled_tokens),
+                self.kv_cache_manager,
+            )
+
         # Clear the finished and preempted request IDs.
         # NOTE: We shouldn't just clear() here because it will also affect
         # the scheduler output.
@@ -2284,6 +2295,14 @@ class Scheduler(SchedulerInterface):
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
 
+        kv_read_errors: dict[str, RequestError] = {}
+        if self.kv_read_check is not None:
+            kv_read_errors, bad_block_ids = self.kv_read_check.update_from_output(
+                model_runner_output.kv_read_checksums
+            )
+            # Keep the corrupted KV from new prefix-cache hits.
+            self.kv_cache_manager.evict_blocks(bad_block_ids)
+
         failed_kv_load_req_ids: set[str] = set()
         if kv_connector_output and kv_connector_output.failed_recving:
             failed_kv_load_req_ids.update(
@@ -2317,6 +2336,9 @@ class Scheduler(SchedulerInterface):
                     output_is_stale = True
                     request.num_stale_output_tokens -= num_tokens_scheduled
                     assert request.num_stale_output_tokens >= 0
+            if req_id in kv_read_errors:
+                # Its tokens were sampled from corrupted KV.
+                continue
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # skip failed or rescheduled requests from KV load failure
                 continue
@@ -2556,7 +2578,7 @@ class Scheduler(SchedulerInterface):
         for request in continuing_reqs:
             self._enqueue_waiting_request(request)
 
-        request_errors = self.grammar_compile_error_reqs
+        request_errors = self.grammar_compile_error_reqs | kv_read_errors
         self.grammar_compile_error_reqs = {}
         error_req_ids = set(request_errors)
         error_req_ids.update(self.encoder_cache_mismatch_reqs)
@@ -3054,6 +3076,8 @@ class Scheduler(SchedulerInterface):
 
         self.encoder_cache_manager.free(request)
         self._pending_encoder_input_ids.pop(request.request_id, None)
+        if self.kv_read_check is not None:
+            self.kv_read_check.request_finished(request.request_id)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:

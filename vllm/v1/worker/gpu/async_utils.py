@@ -10,6 +10,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+from vllm.v1.core.kv_read_check import KVReadChecksums
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     KVConnectorOutput,
@@ -123,6 +124,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         copy_stream: torch.cuda.Stream,
         check_ep_fault: bool,
         pending_aux_output: "PendingAuxOutput | None",
+        kv_read_checksums: tuple[int, torch.Tensor] | None = None,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -166,6 +168,10 @@ class AsyncOutput(AsyncModelRunnerOutput):
                     num_sampled=self.num_sampled_tokens_np,
                     num_rejected=async_copy_to_np(sampler_output.num_rejected),
                 )
+            self.kv_read_checksums: tuple[int, np.ndarray] | None = None
+            if kv_read_checksums is not None:
+                step_id, values = kv_read_checksums
+                self.kv_read_checksums = (step_id, async_copy_to_np(values))
             if check_ep_fault:
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
@@ -205,6 +211,11 @@ class AsyncOutput(AsyncModelRunnerOutput):
         if self.pending_aux_output is not None:
             self.model_runner_output.aux_output_connector_output = (
                 self.pending_aux_output.process_output()
+            )
+        if self.kv_read_checksums is not None:
+            step_id, values = self.kv_read_checksums
+            self.model_runner_output.kv_read_checksums = KVReadChecksums(
+                step_id, values.view(np.uint64)
             )
 
         if self._has_fault is not None and self._has_fault.item():
